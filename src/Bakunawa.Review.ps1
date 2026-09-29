@@ -164,9 +164,26 @@ function Show-OrphanScanResults {
         catch { Write-ReviewLine 'Item number is out of range.'; continue }
         if (@($numbers | Where-Object { $_ -lt 1 -or $_ -gt $findings.Count }).Count) { Write-ReviewLine 'Item number is out of range.'; continue }
         $selection = @($numbers | ForEach-Object { $findings[$_ - 1] })
-        Write-ReviewLine 'Permanently delete these items:'
-        foreach ($item in $selection) { Write-ReviewLine $item.Path; Write-ReviewLine $item.Reason }
-        Write-ReviewLine 'Deletion is permanent. There is no recovery copy.'
+        # The one framed screen in the app. It leads with the total, names every
+        # path, repeats that there is no undo, and only then asks.
+        $frameLines = @(
+            "Permanently delete $($selection.Count) item$(if ($selection.Count -eq 1) { '' } else { 's' })?"
+            ''
+            "$(Format-FileSize (($selection | Measure-Object Size -Sum).Sum)) will be removed from C:\. No recovery copy is kept."
+        )
+        $frameColors = @('White', 'White', 'Yellow')
+        foreach ($item in $selection) {
+            $frameLines += $item.Path
+            $frameColors += 'White'
+            $frameLines += "  $($item.Reason)"
+            $frameColors += 'Gray'
+        }
+        $frameLines += ''
+        $frameLines += 'Deletion is permanent. There is no recovery copy.'
+        $frameColors += 'Yellow'
+        Write-ReviewLine
+        Write-ConfirmFrame -Lines $frameLines -Colors $frameColors
+        Write-ReviewLine
         if ((Read-Host 'Type DELETE to proceed; Enter cancels') -cne 'DELETE') { continue }
         foreach ($item in $selection) {
             try {
