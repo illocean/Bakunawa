@@ -155,3 +155,51 @@ Describe 'Clear-AIAgentCaches safety' {
         Test-Path -LiteralPath $exe | Should -BeTrue -Because '.exe is not a targeted pattern'
     }
 }
+
+Describe 'Shipped app-definition contracts' {
+    BeforeAll {
+        $defs = @(Get-AllAppDefinitions)
+    }
+
+    It 'clears OpenChamber through the Dev Caches container path' {
+        $app = $defs | Where-Object Name -eq 'OpenChamber' | Select-Object -First 1
+        $app | Should -Not -BeNullOrEmpty -Because 'OpenChamber Electron caches are 68 MB of reclaimable data'
+        $app.Category | Should -Be 'Dev Caches'
+        $app.Process | Should -Be 'OpenChamber' -Because 'a running app must mark its caches busy, not have them emptied'
+        # Chromium writes extensionless blobs (data_0, f_000000). Entry-mode matching
+        # on *.tmp/*.log/*.bak would silently match nothing, so this must stay a
+        # container location cleared by Measure-AndClear.
+        $app.Mode | Should -Not -Be 'entry'
+    }
+
+    It 'names only OpenChamber cache directories, never its profile' {
+        $paths = @($defs | Where-Object Name -eq 'OpenChamber' | ForEach-Object { Split-Path -Leaf $_.Path })
+        $paths | Should -Not -BeNullOrEmpty
+        foreach ($leaf in $paths) {
+            $leaf | Should -BeIn @('Cache', 'Code Cache', 'GPUCache', 'DawnGraphiteCache',
+                                  'DawnWebGPUCache', 'logs') -Because "$leaf is disposable by Chromium's own contract"
+        }
+        # Partitions, Local Storage, Session Storage and Network hold live user state.
+        foreach ($forbidden in @('Partitions', 'Local Storage', 'Session Storage', 'Network', 'Preferences')) {
+            $paths | Should -Not -Contain $forbidden
+        }
+    }
+
+    It 'sweeps Playwright MCP console logs through the guarded AI path' {
+        $app = $defs | Where-Object Name -eq 'Playwright MCP' | Select-Object -First 1
+        $app | Should -Not -BeNullOrEmpty
+        $app.Category | Should -Be 'AI Agent Caches'
+        $app.Path | Should -BeLike '*\.playwright-mcp'
+        $app.Mode | Should -Not -Be 'container'
+    }
+
+    It 'keeps the AI Agent set pointed at containers, never at a profile root' {
+        $rootish = @('\.opencode', '\.mcp', '\.mcp-hub', '\.cache', '\node_modules')
+        foreach ($app in @($defs | Where-Object Category -eq 'AI Agent Caches')) {
+            foreach ($suffix in $rootish) {
+                ($app.Path.EndsWith($suffix, [StringComparison]::OrdinalIgnoreCase)) |
+                    Should -BeFalse -Because "$($app.Name) must not clear $($app.Path)"
+            }
+        }
+    }
+}

@@ -374,6 +374,19 @@
     ]
   },
   {
+    "name": "OpenChamber",
+    "process": "OpenChamber",
+    "category": "Dev Caches",
+    "locations": [
+      { "env": "APPDATA", "path": "OpenChamber/Cache" },
+      { "env": "APPDATA", "path": "OpenChamber/Code Cache" },
+      { "env": "APPDATA", "path": "OpenChamber/GPUCache" },
+      { "env": "APPDATA", "path": "OpenChamber/DawnGraphiteCache" },
+      { "env": "APPDATA", "path": "OpenChamber/DawnWebGPUCache" },
+      { "env": "APPDATA", "path": "OpenChamber/logs" }
+    ]
+  },
+  {
     "name": "9Router",
     "process": "9router",
     "category": "AI Agent Caches",
@@ -401,6 +414,13 @@
       { "env": "LOCALAPPDATA", "path": "MiMo Code/Cache" },
       { "env": "LOCALAPPDATA", "path": "MiMo Code/logs" },
       { "env": "APPDATA", "path": "MiMo Code/logs" }
+    ]
+  },
+  {
+    "name": "Playwright MCP",
+    "category": "AI Agent Caches",
+    "locations": [
+      { "env": "USERPROFILE", "path": ".playwright-mcp" }
     ]
   }
 ]
