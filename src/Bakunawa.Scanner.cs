@@ -1,6 +1,7 @@
 using System;
 using System.IO;
 using System.Collections.Generic;
+using System.Runtime.InteropServices;
 
 namespace Bakunawa {
     public sealed class ScanEntry {
@@ -12,23 +13,39 @@ namespace Bakunawa {
 
     // One iterative, streaming walk. Memory follows tree depth, not file count.
     public static class Scanner {
+        [DllImport("shell32.dll")]
+        static extern int SHGetKnownFolderPath(ref Guid id, uint flags, IntPtr token, out IntPtr path);
+
+        public static string KnownFolder(string id) {
+            Guid folder = new Guid(id);
+            IntPtr path = IntPtr.Zero;
+            try {
+                // DONT_VERIFY returns redirected paths without creating or opening folders.
+                Marshal.ThrowExceptionForHR(SHGetKnownFolderPath(ref folder, 0x4000, IntPtr.Zero, out path));
+                return Marshal.PtrToStringUni(path);
+            } finally { if (path != IntPtr.Zero) Marshal.FreeCoTaskMem(path); }
+        }
+
         // Check ancestors before touching descendants: C:\link\cache may live on D:.
         public static bool IsAllowedPath(string path) {
-            if (String.IsNullOrWhiteSpace(path)) return false;
+            return PathIssue(path) == null;
+        }
+        public static string PathIssue(string path) {
+            if (String.IsNullOrWhiteSpace(path)) return "Empty path";
             path = path.Replace('/', '\\');
-            if (!path.StartsWith("C:\\", StringComparison.OrdinalIgnoreCase) || path.IndexOf(':', 2) >= 0) return false;
+            if (!path.StartsWith("C:\\", StringComparison.OrdinalIgnoreCase) || path.IndexOf(':', 2) >= 0) return "C: only; absolute local paths required";
             try {
                 string full = Path.GetFullPath(path);
                 string current = "C:\\";
                 foreach (string part in full.Substring(3).Split(new char[] { '\\' }, StringSplitOptions.RemoveEmptyEntries)) {
                     current = Path.Combine(current, part);
                     try {
-                        if ((File.GetAttributes(current) & (FileAttributes.ReparsePoint | FileAttributes.Offline)) != 0) return false;
+                        if ((File.GetAttributes(current) & (FileAttributes.ReparsePoint | FileAttributes.Offline)) != 0) return "Reparse point or offline content: " + current;
                     } catch (FileNotFoundException) { }
                       catch (DirectoryNotFoundException) { }
                 }
-                return true;
-            } catch { return false; }
+                return null;
+            } catch (Exception e) { return e.Message; }
         }
 
         sealed class Frame : IDisposable {
@@ -61,7 +78,7 @@ namespace Bakunawa {
         }
         public static IEnumerable<ScanEntry> Walk(string root, string[] exclusions, bool discovery) {
             if (!IsAllowedPath(root)) {
-                yield return new ScanEntry { Path = root, Kind = "Skipped", Message = "C: only; Reparse points, offline and inaccessible paths are blocked", Complete = false };
+                yield return new ScanEntry { Path = root, Kind = "Skipped", Message = PathIssue(root), Complete = false };
                 yield break;
             }
             var stack = new Stack<Frame>();

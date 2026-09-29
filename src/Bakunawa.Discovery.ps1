@@ -7,7 +7,10 @@ function Get-ScanDriveRoots {
 
 function Initialize-CleanupState {
     [CmdletBinding()]
-    param([hashtable]$Config, [string[]]$ScanRoot, [string[]]$ExtraExcludePath)
+    param([hashtable]$Config, [string[]]$ScanRoot, [string[]]$ExtraExcludePath,
+        [switch]$VerboseScan, [switch]$Aggressive)
+    if ($PSBoundParameters.ContainsKey('VerboseScan')) { $script:VerboseScan = [bool]$VerboseScan }
+    if ($PSBoundParameters.ContainsKey('Aggressive')) { $script:IsAggressive = [bool]$Aggressive }
     if (-not $Config) { $Config = Get-UserConfig }
     $script:CleanupConfig = $Config
     if ($PSBoundParameters.ContainsKey('ScanRoot')) { $script:ScanRoots = $ScanRoot }
@@ -19,26 +22,87 @@ function Initialize-CleanupState {
     $script:ProcessedCacheRoots = New-TrackedSet
     $script:BusyCachePaths = [Collections.Generic.List[string]]::new()
     $script:KnownCachePaths = @{}
+    $script:OrphanRulePaths = @{}
+    $script:DefinitionPaths = [Collections.Generic.List[object]]::new()
     $cacheNames = Get-DisposableDirectoryNames
     foreach ($app in @(Get-AllAppDefinitions)) {
         if ($app.Path) {
             $busy = $app.Process -and (Test-AnyProcessRunning -RunningProcesses $script:RunningProcesses -Names @($app.Process))
-            $cacheName = [IO.Path]::GetFileName($app.Path.Replace('/', '\').TrimEnd('\'))
-            if (-not $busy -and -not $cacheNames.Contains($cacheName)) { continue }
             try { $paths = @(Expand-WildcardPath -Path $app.Path -DirectoriesOnly) }
             catch { Register-SkippedItem -Reason $_.Exception.Message -Target $app.Path; continue }
             foreach ($path in $paths) {
                 $full = [IO.Path]::GetFullPath($path).TrimEnd('\')
+                $script:DefinitionPaths.Add([pscustomobject]@{ Path = $full; Name = $app.Name; Process = $app.Process })
                 if ($busy) { $script:BusyCachePaths.Add($full) }
                 # Only explicitly named disposable caches qualify; installed tools and app data do not.
                 if ($cacheNames.Contains([IO.Path]::GetFileName($full))) { $script:KnownCachePaths[$full] = $app }
+                if ($app.OrphanRule) { $script:OrphanRulePaths[$full] = $app }
             }
         }
     }
-    $script:UseQuarantine = ($Config.behaviorSettings.quarantineBeforeDelete -ne $false)
     $script:OrphanCache = $null
     $script:OrphanCacheTime = $null
     $script:LastScanReport = $null
+}
+
+function Get-OrphanShortcutRoots {
+    foreach ($folder in @('Programs','CommonPrograms')) {
+        $root = [Environment]::GetFolderPath($folder)
+        if (-not $root) { throw "Cannot resolve $folder shortcuts." }
+        $root
+    }
+}
+
+function Test-OrphanEvidence {
+    [CmdletBinding()]
+    param([Parameter(Mandatory)]$App)
+    $rule = $App.OrphanRule
+    $result = [pscustomobject]@{ Rule = $null; Eligible = $false; Reason = 'No evidence rule'; Checks = @(); Issues = @() }
+    if (-not $rule.id) { return $result }
+    $result.Rule = "$($App.SourceFile):$($rule.id)"
+    try {
+        if (-not $rule.uninstallNames -or -not $rule.executables -or -not $rule.shortcutNames -or -not $App.Process) {
+            throw 'Incomplete orphan rule: uninstall names, executable paths, shortcut names and processes are required.'
+        }
+        $checkPath = 'Uninstall registry'
+        $installed = @(Get-InstalledApplicationNames -SkipCaching -Strict)
+        foreach ($pattern in $rule.uninstallNames) {
+            if (@($installed | Where-Object { $_ -like $pattern }).Count) { throw 'Matching installed application exists.' }
+        }
+        $result.Checks += 'Uninstall entries absent (registry enumeration complete)'
+        if (Test-AnyProcessRunning -RunningProcesses (Get-RunningProcessNames) -Names @($App.Process)) { throw 'Owning application is running.' }
+        foreach ($location in $rule.executables) {
+            $base = Get-EnvPath $location.env
+            if (-not $base -or -not $location.path) { throw 'Executable location could not be resolved.' }
+            $pattern = Join-Path $base $location.path
+            $checkPath = $pattern
+            foreach ($path in @(Expand-WildcardPath -Path $pattern -Strict)) {
+                try { $null = Get-Item -LiteralPath $path -Force -ErrorAction Stop; throw "Executable exists: $path" }
+                catch [Management.Automation.ItemNotFoundException] { }
+            }
+        }
+        $result.Checks += 'Declared executable locations absent (enumeration complete)'
+        foreach ($root in @(Get-OrphanShortcutRoots)) {
+            $checkPath = $root
+            foreach ($entry in [Bakunawa.Scanner]::Walk($root, [string[]]@())) {
+                if (-not $entry.Complete) { throw "Shortcut check inconclusive: $($entry.Path): $($entry.Message)" }
+                if ($entry.Kind -eq 'File' -and [IO.Path]::GetExtension($entry.Path) -eq '.lnk') {
+                    foreach ($pattern in $rule.shortcutNames) {
+                        if ([IO.Path]::GetFileNameWithoutExtension($entry.Path) -like $pattern) { throw "Matching shortcut exists: $($entry.Path)" }
+                    }
+                }
+            }
+        }
+        $result.Checks += 'Declared Start Menu shortcuts absent (enumeration complete)'
+        $result.Eligible = $true
+        $result.Reason = 'App-definition orphan rule matched; all absence checks completed.'
+    } catch {
+        $result.Reason = $_.Exception.Message
+        if ($result.Reason -notmatch 'Matching installed application exists|Executable exists:|Matching shortcut exists:|Owning application is running|Incomplete orphan rule:') {
+            $result.Issues = @([pscustomobject]@{ Path = $checkPath; Kind = 'Error'; Reason = $result.Reason })
+        }
+    }
+    return $result
 }
 
 function Get-ScanExclusions {
@@ -47,8 +111,7 @@ function Get-ScanExclusions {
         $path = Get-EnvPath $name
         if ($path) { $paths += $path }
     }
-    # Never rediscover quarantine, synced offline data, or Windows-managed stores.
-    if (Get-Command Get-QuarantineRoot -ErrorAction Ignore) { $paths += Get-QuarantineRoot }
+    # Never rediscover Bakunawa's own state, synced offline data, or Windows-managed stores.
     $paths += Join-Path (Get-EnvPath 'LOCALAPPDATA') 'Bakunawa'
     foreach ($root in @(Get-ScanDriveRoots)) {
         foreach ($name in @('$Recycle.Bin','System Volume Information','Windows','Windows.old','Recovery','MSOCache')) {
@@ -95,6 +158,7 @@ function Invoke-OrphanDiscovery {
     if (-not $script:CleanupConfig) { Initialize-CleanupState }
     if (-not $PSBoundParameters.ContainsKey('OlderThanDays') -and $script:CleanupConfig.scanSettings) {
         $OlderThanDays = [int]$script:CleanupConfig.scanSettings.minAgeDays
+        if ($script:IsAggressive) { $OlderThanDays = [int]$script:CleanupConfig.scanSettings.aggressiveMinAgeDays }
         if ($OlderThanDays -lt 1 -or $OlderThanDays -gt 3650) { throw 'Scan minimum age must be between 1 and 3650 days.' }
     }
     if (-not $Roots) { $Roots = $script:ScanRoots }
@@ -129,10 +193,17 @@ function Invoke-OrphanDiscovery {
     foreach ($path in $exclusions) { Write-ScanLogText ("EXCLUSION | {0}" -f $path) }
     $findings = [Collections.Generic.List[object]]::new()
     $issues = [Collections.Generic.List[object]]::new()
+    foreach ($skip in @(Get-CoreSkippedItems)) {
+        $issues.Add([pscustomobject]@{ Path = $skip.Target; Reason = $skip.Reason; Kind = 'Skipped' })
+    }
     $coverage = [Collections.Generic.List[object]]::new()
     $tempRoots = @(Get-ScanTempRoots -Roots @($rootsToScan))
     $appRoots = @((Get-EnvPath 'LOCALAPPDATA'), (Get-EnvPath 'APPDATA'), (Get-EnvPath 'ProgramData')) | Where-Object { $_ }
-    $installed = @(Get-InstalledApplicationNames -SkipCaching)
+    try { $installed = @(Get-InstalledApplicationNames -SkipCaching -Strict) }
+    catch {
+        $installed = @()
+        $issues.Add([pscustomobject]@{ Path = 'Uninstall registry'; Kind = 'Error'; Reason = $_.Exception.Message })
+    }
     $running = @(Get-RunningProcessNames)
     $ownerNames = @($installed) + @($running | ForEach-Object { $_ })
     $cacheNames = Get-DisposableDirectoryNames
@@ -144,6 +215,7 @@ function Invoke-OrphanDiscovery {
             $rootIndex++
             $driveWatch = [Diagnostics.Stopwatch]::StartNew()
             $directories = 0L; $errors = 0; $skipped = 0; $files = 0L
+            $rootUnavailable = $false
             $visited = 0L
             Write-CommandLog 'SCAN' $root
             Write-ScanProgress -Root $root -RootIndex $rootIndex -RootCount $rootsToScan.Count -Candidates $findings.Count -Seconds $watch.Elapsed.TotalSeconds -CurrentPath $root -Force
@@ -154,6 +226,7 @@ function Invoke-OrphanDiscovery {
                     $lastProgress = $watch.ElapsedMilliseconds
                 }
                 if ($entry.Kind -in @('Error','Skipped')) {
+                    if ($entry.Path.TrimEnd('\') -eq $root.TrimEnd('\')) { $rootUnavailable = $true }
                     $issueReason = if ($entry.Path -in $script:BusyCachePaths) { 'Close the owning app and rescan to review this cache.' } else { $entry.Message }
                     $issues.Add([pscustomobject]@{ Path = $entry.Path; Reason = $issueReason; Kind = $entry.Kind })
                     Write-ScanLogText ("{0} | {1} | {2}" -f $entry.Kind, $entry.Path, $issueReason)
@@ -161,17 +234,27 @@ function Invoke-OrphanDiscovery {
                     continue
                 }
                 if ($entry.Kind -eq 'Progress') { continue }
+                if ($script:VerboseScan) { Write-ReviewLine ("Visited: {0} | {1}" -f $entry.Path, $entry.Kind) -ForegroundColor Gray }
                 if ($entry.Kind -ne 'File') { $directories++ }
                 if ($entry.Path.TrimEnd('\') -eq $root.TrimEnd('\')) { $files = $entry.Files; continue }
                 if (-not $entry.Complete) { continue }
                 $knownApp = $script:KnownCachePaths[$entry.Path]
-                if ($entry.LatestWriteUtc -gt $cutoff -and -not $knownApp) { continue }
+                $ruleApp = $script:OrphanRulePaths[$entry.Path]
+                if ($entry.LatestWriteUtc -gt $cutoff -and -not $knownApp -and -not $ruleApp) { continue }
                 $name = [IO.Path]::GetFileName($entry.Path)
                 $parent = [IO.Path]::GetDirectoryName($entry.Path)
                 $inTemp = $false
                 foreach ($temp in $tempRoots) { if ([Bakunawa.Scanner]::Within($entry.Path, $temp)) { $inTemp = $true; break } }
                 $category = $null; $reason = $null; $safe = $false
-                if ($knownApp -and $entry.Kind -ne 'File' -and $entry.Bytes -gt 0) {
+                $evidence = $null
+                if ($ruleApp) {
+                    $evidence = Test-OrphanEvidence -App $ruleApp
+                    foreach ($issue in $evidence.Issues) { $issues.Add($issue) }
+                    $category = 'App-definition orphan'
+                    $reason = $evidence.Reason
+                    $safe = $evidence.Eligible -and $entry.LatestWriteUtc -le $cutoff
+                    if ($entry.LatestWriteUtc -gt $cutoff) { $reason += " Newest modification is less than $OlderThanDays days old." }
+                } elseif ($knownApp -and $entry.Kind -ne 'File' -and $entry.Bytes -gt 0) {
                     $category = 'Known app cache'
                     $reason = "Matched $($knownApp.Name) cache in $($knownApp.SourceFile). Review before removal; the app may rebuild or download it again."
                 } elseif ($entry.LatestWriteUtc -gt $cutoff) { continue
@@ -182,10 +265,9 @@ function Invoke-OrphanDiscovery {
                     } elseif ($ext -in @('.tmp','.temp','.dmp') -or ($ext -eq '.log' -and ($inTemp -or $parent -match '(?i)\\logs?(\\|$)'))) {
                         $category = if ($ext -eq '.log') { 'Stale log file' } else { 'Stale temporary file' }
                         $reason = "Unmodified for at least $OlderThanDays days; extension $ext."
-                        $safe = $inTemp
                     }
                 } elseif ($inTemp -and $entry.Path -notin $tempRoots) {
-                    $category = 'Stale temp folder'; $safe = $true
+                    $category = 'Stale temp folder'
                     $reason = "Known temp location; all readable contents unmodified for at least $OlderThanDays days."
                 } elseif ($cacheNames.Contains($name)) {
                     $category = 'Stale cache folder'
@@ -212,12 +294,14 @@ function Invoke-OrphanDiscovery {
                     LatestWriteUtc = $entry.LatestWriteUtc; Category = $category; Reason = $reason
                     Tier = $(if ($safe) { 'Tier1' } else { 'Tier2' }); RiskLevel = $(if ($safe) { 'Low' } else { 'Medium' })
                     RiskScore = $(if ($safe) { 0 } else { 50 }); SafeDelete = $safe
+                    EvidenceRule = $evidence.Rule; EvidenceChecks = @($evidence.Checks); MinimumAgeDays = $OlderThanDays
                     DetectorName = 'Find-OrphanFolders'; ScanRoot = $root; IsDirectory = ($entry.Kind -ne 'File')
                 })
                 Write-ScanLogText ("PROVISIONAL CANDIDATE | {0} | {1} bytes | {2} | {3}" -f $entry.Path, $entry.Bytes, $category, $reason)
             }
             $coverage.Add([pscustomobject]@{ Root = $root; Directories = $directories; Files = $files; Errors = $errors; Skipped = $skipped
-                DurationSec = [math]::Round($driveWatch.Elapsed.TotalSeconds, 2); Status = $(if ($errors) { 'Partial' } elseif (-not $directories) { 'Unavailable or excluded' } else { 'Complete within exclusions' }) })
+                Visited = ($directories -gt 0 -and -not $rootUnavailable); DurationSec = [math]::Round($driveWatch.Elapsed.TotalSeconds, 2)
+                Status = $(if ($rootUnavailable -or -not $directories) { 'Unavailable or excluded' } elseif ($errors -or $skipped) { 'Incomplete' } else { 'Complete' }) })
             Write-ReviewLine ("Root {0}/{1} finished | {2:N0} files | {3:N0} folders | {4:N0} errors | {5:N0} excluded / skipped | {6}" -f $rootIndex, $rootsToScan.Count, $files, $directories, $errors, $skipped, (Format-ReportDuration $driveWatch.Elapsed.TotalSeconds))
         }
     } finally {
@@ -240,6 +324,9 @@ function Invoke-OrphanDiscovery {
     $script:OrphanCacheTime = Get-Date
     $script:OrphanCacheKey = $cacheKey
     $script:LastScanReport = @{ Findings = $script:OrphanCache; Coverage = @($coverage); Issues = @($issues); Exclusions = $exclusions
+        IsComplete = ($issues.Count -eq 0); Status = $(if ($issues.Count) { 'Incomplete' } else { 'Complete' })
+        RootsVisited = @($coverage | Where-Object Visited | ForEach-Object Root)
+        RootsSkipped = @($coverage | Where-Object { -not $_.Visited } | ForEach-Object Root)
         DurationSec = [math]::Round($watch.Elapsed.TotalSeconds, 2) }
     Write-ScanReportLog -Report $script:LastScanReport
     return $script:OrphanCache
@@ -255,12 +342,13 @@ function Clear-ReviewedOrphans {
         $target = [IO.Path]::GetFullPath($target).TrimEnd('\')
         $finding = $script:OrphanCache | Where-Object { $_.Path -eq $target } | Select-Object -First 1
         if (-not $finding) { throw "Rescan before selecting this path: $target" }
-        foreach ($app in @(Get-AllAppDefinitions)) {
-            if (-not $app.Path -or -not $app.Process -or -not (Test-AnyProcessRunning -RunningProcesses $running -Names @($app.Process))) { continue }
-            foreach ($cache in @(Expand-WildcardPath -Path $app.Path -DirectoriesOnly)) {
-                if ([Bakunawa.Scanner]::Within($target, $cache) -or [Bakunawa.Scanner]::Within($cache, $target)) {
-                    throw "Close $($app.Name) and rescan before removal: $target"
-                }
+        if (-not $finding.EvidenceRule -or -not $finding.SafeDelete) { throw "Review-only; no eligible orphan evidence: $target" }
+        $app = $script:OrphanRulePaths[$target]
+        if (-not $app -or -not (Test-OrphanEvidence -App $app).Eligible) { throw "Orphan evidence no longer passes: $target" }
+        foreach ($app in $script:DefinitionPaths) {
+            if (-not $app.Process -or -not (Test-AnyProcessRunning -RunningProcesses $running -Names @($app.Process))) { continue }
+            if ([Bakunawa.Scanner]::Within($target, $app.Path) -or [Bakunawa.Scanner]::Within($app.Path, $target)) {
+                throw "Close $($app.Name) and rescan before removal: $target"
             }
         }
         $current = [Bakunawa.Scanner]::Inspect($target, [string[]]@(Get-ScanExclusions))
@@ -268,9 +356,11 @@ function Clear-ReviewedOrphans {
             throw "Changed since scan; rescan before removal: $target"
         }
         if ($finding.Category -eq 'Broken shortcut' -and -not (Test-BrokenLocalShortcut $target)) { throw "Shortcut target is no longer confirmed missing: $target" }
-        # Review candidates always go to quarantine, independent of routine-cache settings.
-        $manifest = Move-ItemToQuarantine -Path $target -Reason $finding.Reason -Tier $finding.Tier -DetectorName 'Find-OrphanFolders' -WhatIf:$Preview
-        if (-not $manifest) { throw "Could not quarantine: $target" }
-        $manifest
+        # Quarantine was removed: reviewed candidates are deleted permanently. The Inspect
+        # above already revalidated size, mtime and file count against the scan.
+        if ($Preview) { return $finding }
+        Remove-Item -LiteralPath $target -Recurse -Force -ErrorAction Stop
+        if (Test-Path -LiteralPath $target) { throw "Target remains after removal: $target" }
+        $finding
     }
 }

@@ -128,7 +128,6 @@
     "category": "Productivity",
     "locations": [
       { "env": "LOCALAPPDATA", "path": "Microsoft/Office/16.0/OfficeFileCache" },
-      { "env": "LOCALAPPDATA", "path": "Microsoft/Office/UnsavedFiles" },
       { "env": "APPDATA", "path": "Microsoft/Office/Recent" }
     ]
   }

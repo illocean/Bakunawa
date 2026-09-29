@@ -4,10 +4,7 @@
     "process": "Spotify",
     "category": "App Caches",
     "locations": [
-      { "env": "APPDATA", "path": "Spotify/Cache" },
-      { "env": "APPDATA", "path": "Spotify/Storage" },
-      { "env": "LOCALAPPDATA", "path": "Spotify/Storage" },
-      { "env": "LOCALAPPDATA", "path": "Spotify/Data" }
+      { "env": "APPDATA", "path": "Spotify/Cache" }
     ]
   },
   {

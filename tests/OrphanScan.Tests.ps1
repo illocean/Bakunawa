@@ -1,28 +1,19 @@
 ﻿#requires -Version 5.1
-# Pester v5 tests for Phase 1–5: Quarantine routing, app enumeration, orphan tier classification,
+# Pester v5 tests for Phase 1–5: app enumeration, orphan tier classification,
 # distinct category measurements, and regression verification.
 #
 # Phase root causes verified:
-#   1. Quarantine routing: Remove-ItemSafely routes through Remove-OrphanItem or direct Delete
-#   2. Config respect: $script:UseQuarantine read from config; Preview mode always returns 0
-#   3. Get-InstalledApplicationNames: Registry enumeration, caching, KB hotfix filtering
-#   4. Find-OrphanFolders: Mixed Tier1/2/3, SafeDelete=true only for Tier1, dead code wired
-#   5. Get-CleanupPotential: Distinct category measurements, no triple TEMP duplication
+#   1. Get-InstalledApplicationNames: Registry enumeration, caching, KB hotfix filtering
+#   2. Find-OrphanFolders: Mixed Tier1/2/3, SafeDelete=true only for Tier1, dead code wired
+#   3. Get-CleanupPotential: Distinct category measurements, no triple TEMP duplication
 
 BeforeAll {
     $repoRoot = (Resolve-Path "$PSScriptRoot/..").Path
     Import-Module "$repoRoot/src/Bakunawa.Core.psm1" -Force
     Import-Module "$repoRoot/src/Bakunawa.Config.psm1" -Force -DisableNameChecking
-    Import-Module "$repoRoot/src/Bakunawa.Quarantine.psm1" -Force -DisableNameChecking
     Import-Module "$repoRoot/src/Bakunawa.Cleanup.psm1" -Force -DisableNameChecking
-    # Keep legacy tests inside Pester's disposable sandbox. Script variables in this
-    # test file do not set module state, so configure the actual module explicitly.
-    Import-Module "$repoRoot/src/Bakunawa.Config.psm1" -Force -DisableNameChecking
-    Import-Module "$repoRoot/src/Bakunawa.Quarantine.psm1" -Force -DisableNameChecking
     & (Get-Module Bakunawa.Cleanup) { $script:IsPreview = $true }
     Mock -ModuleName Bakunawa.Cleanup Get-ScanDriveRoots { @($TestDrive) }
-    Mock -ModuleName Bakunawa.Cleanup Get-QuarantineRoot { Join-Path $TestDrive 'Quarantine' }
-    Mock -ModuleName Bakunawa.Quarantine Get-QuarantineRoot { Join-Path $TestDrive 'Quarantine' }
     Mock -ModuleName Bakunawa.Cleanup Get-DirectorySize {
         param($Path)
         # Real sizing for fixture paths; no machine-wide measurements in unit tests.
@@ -37,16 +28,15 @@ BeforeAll {
 AfterAll {
     Remove-Module Bakunawa.Cleanup -ErrorAction SilentlyContinue
     Remove-Module Bakunawa.UI -ErrorAction SilentlyContinue
-    Remove-Module Bakunawa.Quarantine -ErrorAction SilentlyContinue
     Remove-Module Bakunawa.Config -ErrorAction SilentlyContinue
     Remove-Module Bakunawa.Core -ErrorAction SilentlyContinue
 }
 
 # ─────────────────────────────────────────────────────────────────────────────────
-# PHASE 1: Quarantine Routing, Config Respect, Preview Safety
+# PHASE 1: Preview Safety and the Direct-Delete Route
 # ─────────────────────────────────────────────────────────────────────────────────
 
-Describe 'Phase 1: Quarantine Routing & Preview Safety' {
+Describe 'Phase 1: Preview Safety & Direct Deletion' {
 
     BeforeEach {
         # Sandbox state
@@ -57,7 +47,6 @@ Describe 'Phase 1: Quarantine Routing & Preview Safety' {
         $script:IsPreview = $true
         $script:RunningProcesses = @()
         $script:ExcludedPaths = $null
-        $script:UseQuarantine = $true
     }
 
     AfterEach {
@@ -72,7 +61,6 @@ Describe 'Phase 1: Quarantine Routing & Preview Safety' {
         New-Item -ItemType Directory -Path $testDir -Force | Out-Null
 
         $script:IsPreview = $true
-        $script:UseQuarantine = $true
         $script:ExcludedPaths = $null
 
         # Act & Assert
@@ -92,17 +80,31 @@ Describe 'Phase 1: Quarantine Routing & Preview Safety' {
         $? | Should -Be $true
     }
 
-    It '$script:UseQuarantine setting affects item deletion route' {
+    It 'Remove-ItemSafely deletes directly and frees the space' {
         # Arrange
-        $testFile = Join-Path $script:tmpRoot 'test.txt'
-        [System.IO.File]::WriteAllBytes($testFile, (New-Object byte[] 1024))
+        $testDir = Join-Path $script:tmpRoot 'stale_cache'
+        $testFile = Join-Path $testDir 'test.bin'
+        New-Item -ItemType Directory -Path $testDir -Force | Out-Null
+        [System.IO.File]::WriteAllBytes($testFile, (New-Object byte[] 4096))
+        (Get-Item -LiteralPath $testDir).LastWriteTimeUtc = [DateTime]::UtcNow.AddDays(-90)
 
-        # Verify quarantine module is loaded and can be called
-        # Act
-        $quarantineRoot = Get-QuarantineRoot
+        # Remove-ItemSafely reads $script:IsPreview from the MODULE scope, so the flag has to be
+        # cleared there; setting it in the test's script scope would leave Preview on and the
+        # function would return the measurement without deleting anything.
+        & (Get-Module Bakunawa.Cleanup) { $script:IsPreview = $false; $script:Planning = $false }
+        $script:RunningProcesses = @()
+        $script:ExcludedPaths = $null
 
-        # Assert - quarantine root should be configured
-        $quarantineRoot | Should -Not -BeNullOrEmpty -Because 'quarantine must be initialized'
+        # Act. Remove-ItemSafely is a private helper, so it is only reachable in module scope;
+        # -Parameters is how InModuleScope passes values in.
+        $freed = InModuleScope Bakunawa.Cleanup -Parameters @{ TestDir = $testDir } {
+            param($TestDir)
+            Remove-ItemSafely -Path $TestDir -Reason 'Test Cache'
+        }
+
+        # Assert - gone for good, no recovery copy anywhere
+        $freed | Should -Be 4096
+        Test-Path -LiteralPath $testDir | Should -BeFalse
     }
 
     It 'Measure-AndClear with EnsureDirectory flag works correctly' {
@@ -118,15 +120,6 @@ Describe 'Phase 1: Quarantine Routing & Preview Safety' {
 
         # Assert
         $? | Should -Be $true
-    }
-
-    It 'Quarantine path is retrievable via Get-QuarantineRoot' {
-        # Arrange / Act
-        $quarantineRoot = Get-QuarantineRoot
-
-        # Assert
-        $quarantineRoot | Should -Not -BeNullOrEmpty
-        $quarantineRoot -is [string] | Should -Be $true
     }
 }
 
@@ -409,7 +402,6 @@ Describe 'Regression Tests: Existing Functionality' {
         $script:IsPreview = $false
         $script:RunningProcesses = @()
         $script:ExcludedPaths = $null
-        $script:UseQuarantine = $false
     }
 
     AfterEach {
@@ -423,19 +415,6 @@ Describe 'Regression Tests: Existing Functionality' {
         { Clear-CachedOrphans } | Should -Not -Throw
     }
 
-    It 'Show-QuarantineSummary function is available and callable' {
-        # Arrange / Act
-        { Show-QuarantineSummary } | Should -Not -Throw
-    }
-
-    It 'Get-QuarantineRoot returns valid path' {
-        # Arrange / Act
-        $quarantineRoot = Get-QuarantineRoot
-
-        # Assert
-        $quarantineRoot | Should -Not -BeNullOrEmpty
-        $quarantineRoot -is [string] | Should -Be $true
-    }
 
     It 'Find-OrphanFolders executes without errors' {
         # Arrange / Act
@@ -477,15 +456,6 @@ Describe 'Regression Tests: Existing Functionality' {
         $cleanupExports.Keys | Should -Contain 'Measure-AndClear'
     }
 
-    It 'quarantine module exports Move-ItemToQuarantine and Restore-QuarantinedItem' {
-        # Arrange / Act
-        $quarantineExports = Get-Module Bakunawa.Quarantine | Select-Object -ExpandProperty ExportedFunctions
-
-        # Assert
-        $quarantineExports.Keys | Should -Contain 'Move-ItemToQuarantine'
-        $quarantineExports.Keys | Should -Contain 'Restore-QuarantinedItem'
-    }
-
     It 'config module exports Get-UserConfig and Initialize-ConfigModule' {
         # Arrange / Act
         $configExports = Get-Module Bakunawa.Config | Select-Object -ExpandProperty ExportedFunctions
@@ -523,7 +493,7 @@ Describe 'Integration: Full Cleanup Scenario' {
             Find-OrphanFolders | Out-Null
             Get-InstalledApplicationNames | Out-Null
             Clear-CachedOrphans
-            Show-QuarantineSummary | Out-Null
+
         }
 
         # Assert
@@ -554,13 +524,6 @@ Describe 'Integration: Full Cleanup Scenario' {
         }
     }
 
-    It 'quarantine module is operational' {
-        # Arrange / Act
-        $quarantineRoot = Get-QuarantineRoot
 
-        # Assert
-        $quarantineRoot | Should -Not -BeNullOrEmpty
-        $quarantineRoot -like '*Bakunawa*' -or $quarantineRoot -like '*Quarantine*' | Should -Be $true
-    }
 }
 

@@ -19,7 +19,6 @@
     "locations": [
       { "env": "LOCALAPPDATA", "path": "Epic/EpicGamesLauncher/Saved/Logs" },
       { "env": "LOCALAPPDATA", "path": "Epic/EpicGamesLauncher/Saved/webcache" },
-      { "env": "LOCALAPPDATA", "path": "Epic/EpicGamesLauncher/Saved/Config/Windows" },
       { "env": "LOCALAPPDATA", "path": "Epic/UnrealEngine/Common/DerivedDataCache" }
     ]
   },
@@ -107,10 +106,20 @@
   },
   {
     "name": "Roblox",
-    "process": "Roblox",
+    "process": ["RobloxPlayerBeta", "RobloxStudioBeta", "Roblox"],
+    "orphanRule": {
+      "id": "roblox-cache-owner-absent",
+      "uninstallNames": ["Roblox*"],
+      "executables": [
+        { "env": "LOCALAPPDATA", "path": "Roblox/Versions/*/RobloxPlayerBeta.exe" },
+        { "env": "LOCALAPPDATA", "path": "Roblox/Versions/*/RobloxStudioBeta.exe" }
+      ],
+      "shortcutNames": ["Roblox*"]
+    },
     "category": "Game Caches",
     "locations": [
       { "env": "LOCALAPPDATA", "path": "Roblox/logs" },
+      { "env": "LOCALAPPDATA", "path": "Roblox/cache" },
       { "env": "LOCALAPPDATA", "path": "Roblox/Versions/*/ClientCache" }
     ]
   },
@@ -137,8 +146,7 @@
     "process": "RiotClientServices",
     "category": "Game Caches",
     "locations": [
-      { "env": "LOCALAPPDATA", "path": "Riot Games/Riot Client/Logs" },
-      { "env": "LOCALAPPDATA", "path": "Riot Games/Riot Client/Data" }
+      { "env": "LOCALAPPDATA", "path": "Riot Games/Riot Client/Logs" }
     ]
   },
   {

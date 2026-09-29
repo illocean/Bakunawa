@@ -1,7 +1,7 @@
 ﻿#requires -Version 5.1
 BeforeAll {
     $repo = (Resolve-Path "$PSScriptRoot/..").Path
-    foreach ($module in @('Core','Config','Quarantine','Cleanup','UI')) {
+    foreach ($module in @('Core','Config','Cleanup','UI')) {
         Import-Module "$repo/src/Bakunawa.$module.psm1" -Force -DisableNameChecking
     }
     function New-OldFile([string]$Path, [int]$Bytes = 128) {
@@ -22,14 +22,13 @@ Describe 'Drive discovery and cleanup safety' {
         $root = Join-Path $TestDrive ([guid]::NewGuid().ToString('N'))
         $null = New-Item -ItemType Directory -Path $root
         $cfg = Get-DefaultConfig
-        $cfg.behaviorSettings.quarantineBeforeDelete = $false
         Mock -ModuleName Bakunawa.Cleanup Get-AllAppDefinitions { @() }
         Initialize-CleanupState -Config $cfg -ScanRoot @($root) -ExtraExcludePath @()
         Mock -ModuleName Bakunawa.Cleanup Get-ScanDriveRoots { @($root) }
         Mock -ModuleName Bakunawa.Cleanup Get-InstalledApplicationNames { @('Installed Example') }
         Mock -ModuleName Bakunawa.Cleanup Get-ScanExclusions { @() }
         Mock -ModuleName Bakunawa.Cleanup Get-ScanTempRoots { @() }
-        & (Get-Module Bakunawa.Cleanup) { $script:IsPreview = $false; $script:BytesFreed = 0L; $script:QuarantinedBytes = 0L; $script:Errors = @() }
+        & (Get-Module Bakunawa.Cleanup) { $script:IsPreview = $false; $script:BytesFreed = 0L; $script:Errors = @() }
     }
 
     It 'finds C: fixture caches, including zero-byte folders, with correct subtree sizes' {
@@ -138,6 +137,9 @@ Describe 'Drive discovery and cleanup safety' {
         Set-OldTree $root
         $found = @(Find-OrphanFolders -Roots $root -Refresh)
         $found[0].SafeDelete = $true
+        $found[0].EvidenceRule = 'fixture:verified'
+        & (Get-Module Bakunawa.Cleanup) { param($path) $script:OrphanRulePaths[$path] = [pscustomobject]@{Name = 'Fixture'} } $found[0].Path
+        Mock -ModuleName Bakunawa.Cleanup Test-OrphanEvidence { [pscustomobject]@{Eligible = $true} }
         & (Get-Module Bakunawa.Cleanup) { $script:IsPreview = $true }
         Clear-CachedOrphans | Should -Be 1
         Test-Path "$root/cache/a.tmp" | Should -BeTrue
@@ -145,7 +147,11 @@ Describe 'Drive discovery and cleanup safety' {
     It 'requires a rescan when a selected candidate changes' {
         New-OldFile "$root/old.tmp"
         Set-OldTree $root
-        $null = Find-OrphanFolders -Roots $root -Refresh
+        $finding = @(Find-OrphanFolders -Roots $root -Refresh)[0]
+        $finding.SafeDelete = $true
+        $finding.EvidenceRule = 'fixture:verified'
+        & (Get-Module Bakunawa.Cleanup) { param($path) $script:OrphanRulePaths[$path] = [pscustomobject]@{Name = 'Fixture'} } $finding.Path
+        Mock -ModuleName Bakunawa.Cleanup Test-OrphanEvidence { [pscustomobject]@{Eligible = $true} }
         [IO.File]::AppendAllText("$root/old.tmp", 'new data')
         { Clear-ReviewedOrphans -Path "$root/old.tmp" } | Should -Throw '*Changed since scan*'
         Test-Path "$root/old.tmp" | Should -BeTrue
@@ -166,25 +172,20 @@ Describe 'Drive discovery and cleanup safety' {
         Measure-AndClear -Path "$root/cache" -Category Test | Should -BeFalse
         Test-Path "$root/cache/keep/data.bin" | Should -BeTrue
     }
-    It 'quarantines reviewed candidates and restores them without overwriting existing files' {
-        $quarantine = "$root/recovery"
-        Mock -ModuleName Bakunawa.Quarantine Get-QuarantineRoot { $quarantine }
+    It 'deletes reviewed candidates permanently and leaves preview untouched' {
         New-OldFile "$root/old.tmp" 4096
         Set-OldTree $root
-        $null = Find-OrphanFolders -Roots $root -Refresh
-        $preview = Clear-ReviewedOrphans -Path "$root/old.tmp" -Preview
-        Test-Path $quarantine | Should -BeFalse
+        $finding = @(Find-OrphanFolders -Roots $root -Refresh)[0]
+        $finding.SafeDelete = $true
+        $finding.EvidenceRule = 'fixture:verified'
+        & (Get-Module Bakunawa.Cleanup) { param($path) $script:OrphanRulePaths[$path] = [pscustomobject]@{Name = 'Fixture'} } $finding.Path
+        Mock -ModuleName Bakunawa.Cleanup Test-OrphanEvidence { [pscustomobject]@{Eligible = $true} }
+        $null = Clear-ReviewedOrphans -Path "$root/old.tmp" -Preview
         Test-Path "$root/old.tmp" | Should -BeTrue
-        $manifest = Clear-ReviewedOrphans -Path "$root/old.tmp"
+        $null = Clear-ReviewedOrphans -Path "$root/old.tmp"
         Test-Path "$root/old.tmp" | Should -BeFalse
-        Test-Path $manifest.QuarantinedPath | Should -BeTrue
-        New-OldFile "$root/old.tmp" 1
-        { Restore-QuarantinedItem -QuarantineId $manifest.QuarantineId } | Should -Throw '*already exists*'
-        Restore-QuarantinedItem -QuarantineId $manifest.QuarantineId -DestinationPath "$root/restored.tmp" | Should -BeTrue
-        (Get-Item "$root/restored.tmp").Length | Should -Be 4096
-    }
-    It 'rejects a forged quarantine ID containing path traversal' {
-        { Restore-QuarantinedItem -QuarantineId '../outside' } | Should -Throw
+        # No recovery copy exists anywhere: the delete is final and frees the space.
+        Test-Path "$root/recovery" | Should -BeFalse
     }
     It 'resets preview and totals between cleanup runs in the same session' {
         Mock -ModuleName Bakunawa.Cleanup Get-CleanupTasks { @() }
@@ -310,7 +311,7 @@ Describe 'Drive discovery and cleanup safety' {
         Clear-CachedOrphans | Should -Be 0
         Test-Path "$root/App/cache/data.bin" | Should -BeTrue
         Mock -ModuleName Bakunawa.Cleanup Test-AnyProcessRunning { $true }
-        { Clear-ReviewedOrphans -Path "$root/App/cache" -Preview } | Should -Throw '*Close Fixture app*'
+        { Clear-ReviewedOrphans -Path "$root/App/cache" -Preview } | Should -Throw '*Review-only*'
         Initialize-CleanupState -Config $cfg -ScanRoot $root
         @(Find-OrphanFolders -Refresh).Count | Should -Be 0
         (Get-OrphanScanReport).Issues[0].Reason | Should -Match 'Close the owning app'
@@ -325,26 +326,25 @@ Describe 'Drive discovery and cleanup safety' {
         Should -Invoke -ModuleName Bakunawa.Cleanup Clear-RecycleBin -Times 1 -Exactly
     }
 
-    It 'refuses quarantine or restoration on another drive and keeps recovery data intact' {
+    It 'refuses a deletion whose target resolves outside C:' {
         New-OldFile "$root/old.tmp" 256
-        Mock -ModuleName Bakunawa.Quarantine Get-QuarantineRoot { 'D:\Quarantine' }
-        { Move-ItemToQuarantine -Path "$root/old.tmp" -Reason Test -DetectorName Test } | Should -Throw '*C:*'
+        Set-OldTree $root
+        $finding = @(Find-OrphanFolders -Roots $root -Refresh)[0]
+        $finding.SafeDelete = $true
+        $finding.EvidenceRule = 'fixture:verified'
+        & (Get-Module Bakunawa.Cleanup) { param($path) $script:OrphanRulePaths[$path] = [pscustomobject]@{Name = 'Fixture'} } $finding.Path
+        Mock -ModuleName Bakunawa.Cleanup Test-OrphanEvidence { [pscustomobject]@{Eligible = $true} }
+        # A D: target must be refused outright: the cleaner is C:-only.
+        # Remove-ItemSafely is a private helper, so it is only reachable inside module scope.
+        { InModuleScope Bakunawa.Cleanup { Remove-ItemSafely -Path 'D:\no-such-target' -Reason Test } } | Should -Throw '*C:*'
         Test-Path "$root/old.tmp" | Should -BeTrue
-        Mock -ModuleName Bakunawa.Quarantine Get-QuarantineRoot { "$root/recovery" }
-        $manifest = Move-ItemToQuarantine -Path "$root/old.tmp" -Reason Test -DetectorName Test
-        { Restore-QuarantinedItem -QuarantineId $manifest.QuarantineId -DestinationPath 'D:\restored.tmp' } | Should -Throw '*C:*'
-        Test-Path $manifest.QuarantinedPath | Should -BeTrue
-        Restore-QuarantinedItem -QuarantineId $manifest.QuarantineId | Should -BeTrue
-        (Get-Item "$root/old.tmp").Length | Should -Be 256
     }
 
     It 'cleans only Roblox client caches and preserves installed executables' {
         New-OldFile "$root/Roblox/Versions/version-test/ClientCache/data.bin" 1024
         New-OldFile "$root/Roblox/Versions/version-test/RobloxPlayerBeta.exe" 2048
-        Mock -ModuleName Bakunawa.Cleanup Join-EnvPath {
-            if ($Name -eq 'LOCALAPPDATA' -and ($ChildPath -join '/') -eq 'Roblox/Versions/*/ClientCache') {
-                "$root/Roblox/Versions/*/ClientCache"
-            } else { "$root/missing" }
+        Mock -ModuleName Bakunawa.Cleanup Get-AllAppDefinitions {
+            @([pscustomobject]@{ Name = 'Roblox'; Path = "$root/Roblox/Versions/*/ClientCache"; Category = 'Game Caches' })
         }
         Clear-GameCaches | Should -Be 1
         Test-Path "$root/Roblox/Versions/version-test/ClientCache/data.bin" | Should -BeFalse

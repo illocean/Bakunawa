@@ -1,47 +1,6 @@
 {
   "mode": "Menu",
-  "extraExcludePaths": [],
-  "orphanThresholdDays": 30,
-  "logRetention": 7,
-  "parallel": true,
-  "uiStyle": "auto",
   "aggressive": {
-    "enabled": false,
-    "dismCleanup": true,
-    "prefetchCleanup": true,
-    "eventLogsCleanup": true,
-    "fontCacheCleanup": true,
-    "windowsUpdateCleanup": true,
-    "driverStoreCleanup": true,
-    "defenderCleanup": true,
-    "storeCacheCleanup": true
-  },
-  "safety": {
-    "requireAdmin": true,
-    "skipRunningApps": true,
-    "minFileAgeDays": 7,
-    "minFileSizeMB": 1,
-    "protectedPaths": [
-      "USERPROFILE\\Downloads",
-      "USERPROFILE\\Documents",
-      "USERPROFILE\\Desktop",
-      "USERPROFILE\\Pictures",
-      "USERPROFILE\\Videos",
-      "USERPROFILE\\Music",
-      "OneDrive\\Downloads",
-      "LOCALAPPDATA\\Packages"
-    ]
-  },
-  "scan": {
-    "depth": 5,
-    "aggressiveDepth": 8,
-    "unusedDaysThreshold": 90,
-    "orphanDaysThreshold": 30
-  },
-  "logging": {
-    "enabled": true,
-    "level": "INFO",
-    "maxSizeMB": 10,
-    "maxFiles": 5
+    "enabled": false
   }
 }

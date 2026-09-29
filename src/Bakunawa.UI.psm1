@@ -378,37 +378,6 @@ function Show-RunSummary {
 . (Join-Path $PSScriptRoot 'Bakunawa.Reporting.ps1')
 . (Join-Path $PSScriptRoot 'Bakunawa.Review.ps1')
 
-function Show-QuarantineSummary {
-    [CmdletBinding()]
-    param()
-    $items = Get-QuarantineInventory
-    if (-not $items -or $items.Count -eq 0) {
-        Write-Log 'Quarantine is empty.' 'INFO'
-        return
-    }
-
-    Write-SectionHeader 'Quarantine Summary'
-    $totalSize = ($items | Measure-Object -Property SizeBytes -Sum).Sum
-    Write-Host ("  Total items: $($items.Count)") -ForegroundColor DarkGray
-    Write-Host ("  Total size:  $(Format-FileSize $totalSize)") -ForegroundColor DarkGray
-    Write-Host ''
-
-    Write-Host '  Recent items:' -ForegroundColor Cyan
-    $items | Select-Object -First 10 | ForEach-Object {
-        $age = [Math]::Round(((Get-Date) - [DateTime]::Parse($_.Timestamp)).TotalDays, 1)
-        $path = Get-DisplayText $_.OriginalPath 45
-        $tierColor = if ($_.Tier -eq 'Tier1') { 'Green' } elseif ($_.Tier -eq 'Tier2') { 'Yellow' } else { 'Red' }
-        Write-Host ("    {0,-45} {1,10}  [{2}]  {3}d ago" -f $path, (Format-FileSize $_.SizeBytes), $_.Tier, $age) -ForegroundColor $tierColor
-    }
-    if ($items.Count -gt 10) { Write-Host ("    ... and $($items.Count - 10) more") -ForegroundColor DarkGray }
-
-    Write-Host ''
-    Write-Host '  Commands:' -ForegroundColor Cyan
-    Write-Host '    Restore-Item <QuarantineId>           # Restore specific item' -ForegroundColor DarkGray
-    Write-Host '    Clear-ExpiredQuarantine -RetentionDays 30  # Purge old items' -ForegroundColor DarkGray
-    Write-Host '    Get-QuarantineInventory              # Full list' -ForegroundColor DarkGray
-}
-
 
 function Show-HealthDetail {
     [CmdletBinding()]
@@ -459,10 +428,10 @@ Export-ModuleMember -Function @(
     'Show-CleanupPotential',
     'Show-Menu',
     'Show-RunSummary',
+    'Export-ScanReport',
     'Show-OrphanScanResults',
     'Show-CleanupResult',
     'Write-ReviewLine',
-    'Show-QuarantineSummary',
     'Show-HealthDetail',
     'Test-VT100Supported',
     'Get-ModeColor'

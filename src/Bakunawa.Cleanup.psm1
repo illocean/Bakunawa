@@ -10,6 +10,16 @@
 # wrap Measure-AndClear calls in additional try/catch (that would double-collect).
 
 # Private helper: one consistent sink for per-path cleanup errors (collect-errors-and-continue).
+function Get-CleanupFailureReason {
+    param([string]$Message)
+    if ($Message -match 'protected|excluded|reparse|offline|C: only|Refusing to remove') { return 'protected' }
+    if ($Message -match 'evidence') { return 'no evidence' }
+    if ($Message -match 'used by another|sharing|in use|owning app|close the browser|running app') { return 'in use' }
+    if ($Message -match 'Changed since scan') { return 'changed since scan' }
+    if ($Message -match 'denied|unauthorized') { return 'access denied' }
+    return 'error'
+}
+
 function Register-CleanupError {
     [CmdletBinding()]
     param(
@@ -23,12 +33,40 @@ function Register-CleanupError {
         Category = $(if ($Category) { $Category } else { 'Uncategorized' })
         Error    = $Message
     }
+    if ($script:Planning) { Add-CleanupRecord -Path $Path -Category $Category -Reason (Get-CleanupFailureReason $Message) -Detail $Message }
     if (Get-Command Write-ScanLogText -ErrorAction Ignore) { Write-ScanLogText ("CLEANUP ERROR | {0} | {1} | {2}" -f $Category, $Path, $Message) }
 }
 
-# Private helper: consolidated deletion logic respecting quarantine setting and preview mode.
-# This function consolidates the branching logic for all three deletion paths to reduce code duplication
-# and ensure consistent handling of quarantine mode and preview-mode safety.
+function Add-CleanupRecord {
+    param([string]$Path, [string]$Category, [Nullable[long]]$Bytes, [string]$Reason,
+        [string]$Detail, $Measurement, [string]$Detector = 'Cleanup', [string]$Tier = 'Tier1', $Finding)
+    if (-not $script:Planning) { return }
+    if ($script:ActiveCategory) { $Category = $script:ActiveCategory }
+    if (-not $Category) { $Category = 'Discovery' }
+    $script:CandidateRecords.Add([pscustomobject]@{
+        Path = $Path; Category = $Category; Bytes = $Bytes; Reason = $Reason; Detail = $Detail
+        Status = $(if ($Reason) { 'Skipped' } else { 'Eligible' }); Measurement = $Measurement
+        Detector = $Detector; Tier = $Tier; Finding = $Finding; ActedBytes = 0L; OutcomeKnown = $true
+    })
+}
+
+function Test-CleanupDirectory {
+    param([string]$Path)
+    if (-not $Path) { return $false }
+    $issue = [Bakunawa.Scanner]::PathIssue($Path)
+    if ($issue -or (Test-IsExcludedPath $Path)) {
+        if (-not $issue) { $issue = 'Protected folder or exclusion' }
+        Add-CleanupRecord -Path $Path -Reason (Get-CleanupFailureReason $issue) -Detail $issue
+        Register-SkippedItem -Target $Path -Reason $issue
+        return $false
+    }
+    try { return (Get-Item -LiteralPath $Path -Force -ErrorAction Stop).PSIsContainer }
+    catch [Management.Automation.ItemNotFoundException] { return $false }
+    catch { Register-CleanupError -Path $Path -Message $_.Exception.Message; return $false }
+}
+
+# Private helper: the single deletion choke point. Re-validates immediately before every
+# mutation so nothing is deleted on a stale measurement, and honours preview mode.
 # Returns validated bytes for preview or successful processing; failures throw.
 function Remove-ItemSafely {
     [CmdletBinding()]
@@ -39,24 +77,33 @@ function Remove-ItemSafely {
         [string]$DetectorName = 'Cleanup',
         [switch]$Preview
     )
+    $script:PartialActedBytes = 0L
+    $script:PartialOutcomeKnown = $true
     $resolved = [IO.Path]::GetFullPath($Path).TrimEnd('\')
     if ($resolved -eq [IO.Path]::GetPathRoot($resolved).TrimEnd('\') -or
         $resolved -in @((Get-EnvPath 'USERPROFILE'),(Get-EnvPath 'LOCALAPPDATA'),(Get-EnvPath 'APPDATA'),(Get-EnvPath 'SystemRoot'),(Get-EnvPath 'ProgramData'),(Get-EnvPath 'ProgramFiles'),(Get-EnvPath 'ProgramFiles(x86)'))) {
         throw "Refusing to remove a drive or system/profile root: $resolved"
     }
-    $excluded = @(Get-CoreExcludedPaths)
-    if (Get-Command Get-QuarantineRoot -ErrorAction Ignore) { $excluded += Get-QuarantineRoot }
-    $measurement = [Bakunawa.Scanner]::Inspect($resolved, [string[]]@($excluded | Where-Object { $_ }))
+    $measurement = [Bakunawa.Scanner]::Inspect($resolved, [string[]]@(Get-CoreExcludedPaths))
+    if ($script:Planning) {
+        Add-CleanupRecord -Path $resolved -Category $Reason -Bytes $measurement.Bytes -Measurement $measurement -Detector $DetectorName -Tier $Tier -Finding $script:CurrentOrphan
+        return [long]$measurement.Bytes
+    }
     if ($Preview -or $script:IsPreview) { return [long]$measurement.Bytes }
     if ($Tier -eq 'Tier3') { throw "Report-only candidate: $resolved" }
-    if ($script:UseQuarantine) {
-        $manifest = Move-ItemToQuarantine -Path $resolved -Reason $Reason -Tier $Tier -DetectorName $DetectorName
-        if (-not $manifest) { throw "Quarantine failed: $resolved" }
-        $script:QuarantinedBytes += $measurement.Bytes
-    } else {
-        Remove-Item -LiteralPath $resolved -Recurse -Force -ErrorAction Stop
-        if (Test-Path -LiteralPath $resolved) { throw "Target remains after removal: $resolved" }
+    # Quarantine was removed: every delete is final, which is what actually frees the space.
+    # Re-inspect immediately before the mutation so nothing is deleted on a stale measurement.
+    $null = [Bakunawa.Scanner]::Inspect($resolved, [string[]]@(Get-CoreExcludedPaths))
+    try { Remove-Item -LiteralPath $resolved -Recurse -Force -ErrorAction Stop }
+    catch {
+        $failure = $_
+        try {
+            $remaining = [Bakunawa.Scanner]::Inspect($resolved, [string[]]@(Get-CoreExcludedPaths))
+            $script:PartialActedBytes = [math]::Max(0, $measurement.Bytes - $remaining.Bytes)
+        } catch { $script:PartialOutcomeKnown = $false }
+        throw $failure
     }
+    if (Test-Path -LiteralPath $resolved) { throw "Target remains after removal: $resolved" }
     return [long]$measurement.Bytes
 }
 
@@ -68,31 +115,161 @@ function Expand-WildcardPath {
     [CmdletBinding()]
     param(
         [Parameter(Mandatory)][string]$Path,
-        [switch]$DirectoriesOnly
+        [switch]$DirectoriesOnly,
+        [switch]$Strict
     )
-    if ($Path -notmatch '^C:[\\/]') { return @() }
+    if ($Path -notmatch '^C:[\\/]') {
+        if ($Strict) { throw "C: only; cannot verify $Path" }
+        Add-CleanupRecord -Path $Path -Reason 'protected' -Detail 'C: only'
+        return @()
+    }
     $patternPath = $Path -replace '\{sub:([^}]+)\}', '$1' -replace '\{profile\}', '*'
     if ($patternPath -match '\{[^}]+\}') { throw "Unknown cleanup path placeholder: $Path" }
-    if ($patternPath -notmatch '[*?]') {
-        if ([Bakunawa.Scanner]::IsAllowedPath($patternPath)) { [IO.Path]::GetFullPath($patternPath) }
+    if ($patternPath -notmatch '[*?]' -and -not $Strict) {
+        $issue = [Bakunawa.Scanner]::PathIssue($patternPath)
+        if (-not $issue) { [IO.Path]::GetFullPath($patternPath) }
+        else { Add-CleanupRecord -Path $patternPath -Reason (Get-CleanupFailureReason $issue) -Detail $issue; Register-SkippedItem -Target $patternPath -Reason $issue }
         return
     }
     # Expand one segment at a time so wildcards cannot traverse junctions first.
     $paths = @('C:\')
     foreach ($segment in ($patternPath.Substring(3) -split '[\\/]' | Where-Object { $_ })) {
         $paths = @(foreach ($parent in $paths) {
-            if ($segment -match '[*?]') {
+            try {
+                $issue = [Bakunawa.Scanner]::PathIssue($parent)
+                if ($issue) { throw $issue }
+                if (Test-IsExcludedPath $parent) { throw "Protected path: $parent" }
+                if ($segment -match '[*?]' -or $Strict) {
                 $pattern = $segment.Replace('[', '`[').Replace(']', '`]')
-                Get-ChildItem -LiteralPath $parent -Force -ErrorAction SilentlyContinue |
-                    Where-Object { $_.Name -like $pattern -and [Bakunawa.Scanner]::IsAllowedPath($_.FullName) -and (-not $DirectoriesOnly -or $_.PSIsContainer) } |
-                    ForEach-Object { $_.FullName }
+                foreach ($child in @(Get-ChildItem -LiteralPath $parent -Force -ErrorAction Stop | Where-Object { $_.Name -like $pattern })) {
+                    $issue = [Bakunawa.Scanner]::PathIssue($child.FullName)
+                    if ($issue) {
+                        if ($Strict) { throw $issue }
+                        Register-SkippedItem -Target $child.FullName -Reason $issue
+                        Add-CleanupRecord -Path $child.FullName -Reason (Get-CleanupFailureReason $issue) -Detail $issue
+                    } elseif (-not $DirectoriesOnly -or $child.PSIsContainer) { $child.FullName }
+                }
             } else {
                 $candidate = Join-Path $parent $segment
-                if ([Bakunawa.Scanner]::IsAllowedPath($candidate) -and (Test-Path -LiteralPath $candidate)) { $candidate }
+                $issue = [Bakunawa.Scanner]::PathIssue($candidate)
+                if ($issue) { throw $issue }
+                try { $null = Get-Item -LiteralPath $candidate -Force -ErrorAction Stop; $candidate }
+                catch [Management.Automation.ItemNotFoundException] { }
+            }
+            } catch {
+                if ($Strict) { throw }
+                Register-SkippedItem -Target $parent -Reason $_.Exception.Message
+                Add-CleanupRecord -Path $parent -Reason (Get-CleanupFailureReason $_.Exception.Message) -Detail $_.Exception.Message
             }
         })
     }
     $paths
+}
+
+# Resolve the age gate for transient (install-staging) entries. Mirrors the orphan
+# discovery contract: scanSettings.minAgeDays, or aggressiveMinAgeDays in Aggressive
+# mode. A positive per-definition override wins.
+function Get-TransientAgeDays {
+    [CmdletBinding()]
+    param([ValidateRange(0, 3650)][int]$Override = 0)
+    if ($Override -gt 0) { return $Override }
+    $days = 30
+    $cfg = $script:CleanupConfig
+    if ($cfg -and $cfg.scanSettings) {
+        if ($cfg.scanSettings.minAgeDays) { $days = [int]$cfg.scanSettings.minAgeDays }
+        if ($script:IsAggressive -and $cfg.scanSettings.aggressiveMinAgeDays) { $days = [int]$cfg.scanSettings.aggressiveMinAgeDays }
+    }
+    if ($days -lt 1 -or $days -gt 3650) { $days = 30 }
+    return $days
+}
+
+# Human-readable detail for a skip decided by Get-TransientEntryMatches.
+function Get-TransientSkipDetail {
+    param([string]$Reason, [int]$MinAgeDays)
+    switch ($Reason) {
+        'protected' { 'Protected folder or exclusion' }
+        'in use'    { 'Owning application is running' }
+        'not stale' { "Newest write is less than $MinAgeDays days old; an install may be in progress" }
+        default     { $Reason }
+    }
+}
+
+# Read-only enumeration of disposable entries directly inside a container directory.
+# Unlike Expand-WildcardPath this matches names only, never descends, and reports why
+# a match would be skipped so callers log the same decision they act on.
+function Get-TransientEntryMatches {
+    [CmdletBinding()]
+    param(
+        [AllowEmptyString()][string]$Directory,
+        [Parameter(Mandatory)][string[]]$Patterns,
+        [ValidateSet('any','file','directory')][string]$EntryType = 'any',
+        [ValidateRange(0, 3650)][int]$MinAgeDays = 0
+    )
+    if ([string]::IsNullOrWhiteSpace($Directory)) { return }
+    # A missing container is normal: the tool simply is not installed here.
+    if (-not (Test-Path -LiteralPath $Directory -PathType Container)) { return }
+    if (-not [Bakunawa.Scanner]::IsAllowedPath($Directory)) {
+        Register-SkippedItem -Reason ([Bakunawa.Scanner]::PathIssue($Directory)) -Target $Directory
+        return
+    }
+    $cutoff = if ($MinAgeDays -gt 0) { (Get-Date).AddDays(-$MinAgeDays) } else { $null }
+    try { $entries = @(Get-ChildItem -LiteralPath $Directory -Force -ErrorAction Stop) }
+    catch { Register-CleanupError -Path $Directory -Message $_.Exception.Message; return }
+    foreach ($entry in $entries) {
+        $matched = $false
+        foreach ($pattern in $Patterns) { if ($entry.Name -like $pattern) { $matched = $true; break } }
+        if (-not $matched) { continue }
+        if ($EntryType -eq 'directory' -and -not $entry.PSIsContainer) { continue }
+        if ($EntryType -eq 'file' -and $entry.PSIsContainer) { continue }
+        $reason = $null
+        if (Test-IsExcludedPath $entry.FullName) { $reason = 'protected' }
+        elseif ($cutoff -and $entry.LastWriteTime -ge $cutoff) { $reason = 'not stale' }
+        elseif ($script:BusyCachePaths) {
+            foreach ($busy in $script:BusyCachePaths) {
+                if ([Bakunawa.Scanner]::Within($entry.FullName, $busy) -or [Bakunawa.Scanner]::Within($busy, $entry.FullName)) { $reason = 'in use'; break }
+            }
+        }
+        $bytes = $null
+        try { $bytes = [long]([Bakunawa.Scanner]::Inspect($entry.FullName, [string[]]@(Get-CoreExcludedPaths))).Bytes } catch { }
+        [PSCustomObject]@{ FullName = $entry.FullName; Name = $entry.Name; Bytes = $bytes; IsContainer = [bool]$entry.PSIsContainer; Reason = $reason }
+    }
+}
+
+# Check-then-delete for install-staging leftovers. Measure-AndClear cannot do this job:
+# it clears a directory's children and ignores non-containers, so a staging file would
+# survive and a staging folder's container would be emptied instead of the folder.
+function Clear-TransientEntries {
+    [CmdletBinding()]
+    param(
+        [AllowEmptyString()][string]$Directory,
+        [Parameter(Mandatory)][string[]]$Patterns,
+        [ValidateSet('any','file','directory')][string]$EntryType = 'any',
+        [ValidateRange(0, 3650)][int]$MinAgeDays = 0,
+        [string]$Category = 'Dev Caches'
+    )
+    $count = 0
+    foreach ($match in @(Get-TransientEntryMatches -Directory $Directory -Patterns $Patterns -EntryType $EntryType -MinAgeDays $MinAgeDays)) {
+        if ($match.Reason) {
+            $detail = Get-TransientSkipDetail -Reason $match.Reason -MinAgeDays $MinAgeDays
+            Register-SkippedItem -Reason $detail -Target $match.FullName -Category $Category -Bytes $match.Bytes
+            Add-CleanupRecord -Path $match.FullName -Category $Category -Bytes $match.Bytes -Reason $match.Reason -Detail $detail
+            continue
+        }
+        try {
+            $size = Remove-ItemSafely -Path $match.FullName -Reason $Category -Preview:$script:IsPreview
+            $script:BytesFreed += $size
+            $script:TaskBytes += $size
+            $script:TaskCleared++
+            if (-not $script:CategorySizes) { $script:CategorySizes = @{} }
+            if (-not $script:CategorySizes.ContainsKey($Category)) { $script:CategorySizes[$Category] = [long]0 }
+            $script:CategorySizes[$Category] += [long]$size
+            Write-CommandLog $(if ($script:IsPreview) { 'PREVIEW' } else { 'PROCESSED' }) "$($match.FullName) ($(Format-FileSize $size))"
+            $count++
+        } catch {
+            Register-CleanupError -Path $match.FullName -Category $Category -Message $_.Exception.Message
+        }
+    }
+    return $count
 }
 
 # Read-only accessor for collected cleanup errors (post-run reporting / diagnostics).
@@ -110,6 +287,7 @@ function Measure-AndClear {
     if (-not [Bakunawa.Scanner]::IsAllowedPath($Path)) {
         Register-SkippedItem -Reason 'C: only; linked, offline or inaccessible paths are skipped' -Target $Path
         $script:TaskSkipped++
+        Add-CleanupRecord -Path $Path -Category $Category -Reason (Get-CleanupFailureReason ([Bakunawa.Scanner]::PathIssue($Path))) -Detail ([Bakunawa.Scanner]::PathIssue($Path))
         return $false
     }
     $Path = [IO.Path]::GetFullPath($Path).TrimEnd('\')
@@ -118,22 +296,22 @@ function Measure-AndClear {
         if ([Bakunawa.Scanner]::Within($Path, $busy) -or [Bakunawa.Scanner]::Within($busy, $Path)) {
             Register-SkippedItem -Reason 'Close the owning app to clean this cache' -Target $Path
             $script:TaskSkipped++
+            $bytes = $null
+            try { $bytes = ([Bakunawa.Scanner]::Inspect($Path, [string[]]@(Get-CoreExcludedPaths))).Bytes } catch { }
+            Add-CleanupRecord -Path $Path -Category $Category -Bytes $bytes -Reason 'in use' -Detail 'Owning application is running'
             return $false
         }
     }
     if (Test-IsExcludedPath $Path) {
         Register-SkippedItem -Reason 'Path is excluded from cleanup' -Target $Path
         $script:TaskSkipped++
+        Add-CleanupRecord -Path $Path -Category $Category -Reason 'protected' -Detail 'Protected folder or exclusion'
         return $false
     }
     try {
-        if (-not (Test-Path -LiteralPath $Path -PathType Container)) {
-            if ($EnsureDirectory -and -not $script:IsPreview) {
-                New-Item -ItemType Directory -Path $Path -Force -ErrorAction Stop | Out-Null
-                return $true
-            }
-            return $false
-        }
+        try { $item = Get-Item -LiteralPath $Path -Force -ErrorAction Stop }
+        catch [Management.Automation.ItemNotFoundException] { return $false }
+        if (-not $item.PSIsContainer) { return $false }
         Write-ReviewLine ("{0}: {1}" -f $(if ($script:IsPreview) { 'Measuring' } else { 'Processing' }), $Path) -ForegroundColor Gray
         # Preserve the cache root and process siblings independently when one is locked.
         $size = 0L; $processed = 0
@@ -179,11 +357,6 @@ function Get-CleanupTasks {
     $null = $tasks.Add([PSCustomObject]@{ Name = 'Log Files'; Parallel = $false })
     $null = $tasks.Add([PSCustomObject]@{ Name = 'Empty/Stale Folders'; Parallel = $false })
     $null = $tasks.Add([PSCustomObject]@{ Name = 'Orphan Scan'; Parallel = $false })
-    if ($Mode -eq 'Aggressive') {
-        $null = $tasks.Add([PSCustomObject]@{ Name = 'Prefetch'; Parallel = $false })
-        $null = $tasks.Add([PSCustomObject]@{ Name = 'DISM'; Parallel = $false })
-        $null = $tasks.Add([PSCustomObject]@{ Name = 'Event Logs + Font Cache'; Parallel = $false })
-    }
     $null = $tasks.Add([PSCustomObject]@{ Name = 'User Hidden Folders'; Parallel = $false })
     $null = $tasks.Add([PSCustomObject]@{ Name = 'Scoop Cache'; Parallel = $false })
     $null = $tasks.Add([PSCustomObject]@{ Name = 'Rust Cargo Cache'; Parallel = $false })
@@ -261,8 +434,8 @@ function Get-CleanupPotential {
                         $count++
                     }
                 }
-                # Process devtools-extended app definitions
-                $extendedDefs = Get-AppDefinitions -Category 'devtools-extended' | Where-Object { $_.Category -eq 'Dev Caches' }
+                # Process every Dev Caches app definition across app-definitions/*.json
+                $extendedDefs = Get-AllAppDefinitions -Category 'Dev Caches'
                 foreach ($app in $extendedDefs) {
                     if (-not $app.Name) { continue }
                     try {
@@ -273,6 +446,18 @@ function Get-CleanupPotential {
                         $expandedPath = $expandedPath -replace '{commonprogramfiles}', $env:COMMONPROGRAMFILES
                         $expandedPath = $expandedPath -replace '{systemdrive}', $env:SYSTEMDRIVE
                         $expandedPath = $expandedPath -replace '{windows}', $env:WINDIR
+                        # Entry-mode locations name a container of disposable leftovers.
+                        # Measuring the container itself would report unrelated data.
+                        if ($app.Mode -eq 'entry') {
+                            if (-not $app.EntryPatterns) { continue }
+                            $ageDays = Get-TransientAgeDays -Override $app.MinAgeDays
+                            foreach ($match in @(Get-TransientEntryMatches -Directory $expandedPath -Patterns @($app.EntryPatterns) -EntryType $app.EntryType -MinAgeDays $ageDays)) {
+                                if ($match.Reason -or $null -eq $match.Bytes) { continue }
+                                $bytes += [long]$match.Bytes
+                                $count++
+                            }
+                            continue
+                        }
                         foreach ($resolved in @(Expand-WildcardPath -Path $expandedPath -DirectoriesOnly)) {
                             if (Test-Path -LiteralPath $resolved -PathType Container) {
                                 $bytes += Get-DirectorySize $resolved
@@ -333,31 +518,13 @@ function Get-CleanupPotential {
                     }
                 }
             }
-            'Game Caches' {
-                foreach ($gc in @(
-                    (Join-EnvPath 'LOCALAPPDATA' 'Roblox' 'cache'),
-                    "$(Join-EnvPath 'PROGRAMFILES' 'Steam')\steamapps\shadercache",
-                    (Join-EnvPath 'PROGRAMDATA' 'Epic\UnrealEngineLauncher\Saved\Cache'),
-                    (Join-EnvPath 'PROGRAMDATA' 'Battle.net\Cache')
-                )) {
-                    if ($gc -and (Test-Path -LiteralPath $gc -PathType Container)) {
-                        $bytes += Get-DirectorySize $gc
-                        $count++
-                    }
-                }
-            }
-            'Browser Automation Caches' {
-                foreach ($bac in @(
-                    (Join-EnvPath 'LOCALAPPDATA' 'ms-playwright'),
-                    (Join-EnvPath 'USERPROFILE' '.cache\ms-playwright'),
-                    (Join-EnvPath 'USERPROFILE' '.puppeteer'),
-                    (Join-EnvPath 'LOCALAPPDATA' 'puppeteer'),
-                    (Join-EnvPath 'LOCALAPPDATA' 'SeleniumHQ'),
-                    (Join-EnvPath 'USERPROFILE' '.selenium')
-                )) {
-                    if ($bac -and (Test-Path -LiteralPath $bac -PathType Container)) {
-                        $bytes += Get-DirectorySize $bac
-                        $count++
+            { $_ -in @('Game Caches','Browser Automation Caches') } {
+                foreach ($app in @(Get-AllAppDefinitions -Category $taskName)) {
+                    foreach ($path in @(Expand-WildcardPath -Path $app.Path -DirectoriesOnly)) {
+                        if (Test-Path -LiteralPath $path -PathType Container) {
+                            $bytes += Get-DirectorySize $path
+                            $count++
+                        }
                     }
                 }
             }
@@ -384,8 +551,10 @@ function Get-CleanupPotential {
                 }
             }
             'Log Files' {
-                $logRoots = @((Join-EnvPath 'SYSTEMROOT' 'System32' 'winevt' 'Logs'))
-                foreach ($l in $logRoots) {
+                # Must mirror Clear-SystemLogFiles: event logs and C:\Windows\Logs are
+                # retained, so measuring them here would over-report the category.
+                foreach ($l in @((Join-EnvPath 'LOCALAPPDATA' 'Microsoft' 'Windows' 'WebCache'),
+                                  (Join-EnvPath 'LOCALAPPDATA' 'Microsoft' 'Windows' 'IECompatCache'))) {
                     if ($l -and (Test-Path -LiteralPath $l -PathType Container)) {
                         $bytes += Get-DirectorySize $l
                         $count++
@@ -501,7 +670,7 @@ function Get-CleanupPotential {
 function Remove-FilesByPattern {
     [CmdletBinding()]
     param([ValidateNotNullOrEmpty()][string]$Directory, [ValidateNotNullOrEmpty()][string[]]$Patterns, [string]$Category = 'General')
-    if (-not [Bakunawa.Scanner]::IsAllowedPath($Directory) -or -not (Test-Path -LiteralPath $Directory -PathType Container)) { return 0 }
+    if (-not (Test-CleanupDirectory $Directory)) { return 0 }
     $pending = [Collections.Generic.Stack[string]]::new()
     $pending.Push([IO.Path]::GetFullPath($Directory))
     $count = 0
@@ -528,10 +697,33 @@ function Remove-FilesByPattern {
     return $count
 }
 
+# True when every direct child of a directory predates the configured cleanup age.
+# Guards the conventional scratch roots (C:\temp, C:\tmp), which routinely hold a user's
+# own install-staging and scratch files and must not be swept just because they are named
+# like a temp directory.
+function Test-DirectoryFullyStale {
+    [CmdletBinding()]
+    param([AllowEmptyString()][string]$Path)
+    if (-not $Path -or -not (Test-Path -LiteralPath $Path -PathType Container)) { return $false }
+    $cutoff = (Get-Date).AddDays(-(Get-TransientAgeDays))
+    $children = @(Get-ChildItem -LiteralPath $Path -Force -ErrorAction SilentlyContinue)
+    if ($children.Count -eq 0) { return $true }
+    foreach ($child in $children) { if ($child.LastWriteTime -ge $cutoff) { return $false } }
+    return $true
+}
+
 function Clear-SystemCaches {
     [CmdletBinding()]
     param()
     $cat = 'System Caches'; $n = 0
+    # C:\temp and C:\tmp are conventional scratch roots, not owned temp directories. Only
+    # sweep them when nothing in them has been touched since the configured cleanup age.
+    foreach ($scratch in @((Join-Path (Get-EnvPath 'SystemDrive') 'temp'),
+                            (Join-Path (Get-EnvPath 'SystemDrive') 'tmp'))) {
+        if ($scratch -and (Test-Path -LiteralPath $scratch -PathType Container) -and -not (Test-DirectoryFullyStale $scratch)) {
+            Register-SkippedItem -Reason 'Scratch root has recent files; not swept as system cache' -Target $scratch
+        }
+    }
     # Resolve then dedupe: %TEMP% and %LOCALAPPDATA%\Temp are usually the same directory
     $targets = @(
         (Get-EnvPath 'TEMP'), (Join-EnvPath 'LOCALAPPDATA' 'Temp'),
@@ -539,7 +731,9 @@ function Clear-SystemCaches {
         $script:SysLoc.WerArchive, $script:SysLoc.WerQueue, $script:SysLoc.NetDownloader,
         (Join-Path (Get-EnvPath 'SystemDrive') 'temp'),
         (Join-Path (Get-EnvPath 'SystemDrive') 'tmp')
-    ) | Where-Object { $_ } | ForEach-Object { Resolve-FullPath $_ } | Select-Object -Unique
+    ) | Where-Object { $_ } | ForEach-Object { Resolve-FullPath $_ } |
+        Where-Object { $_ -notmatch '^[A-Za-z]:\\(temp|tmp)$' -or (Test-DirectoryFullyStale $_) } |
+        Select-Object -Unique
     foreach ($t in $targets) { if ($t -and (Measure-AndClear $t -EnsureDirectory -Category $cat)) { $n++ } }
     if (-not [Bakunawa.Scanner]::IsAllowedPath($script:SysLoc.WindowsRoot)) { return $n }
     $restart = @()
@@ -647,7 +841,7 @@ function Clear-AppCaches {
 
             $appsubcat = "$($app.Name) - $($app.Category)"
             foreach ($resolvedPath in @(Expand-WildcardPath -Path $expandedPath -DirectoriesOnly)) {
-                if (Test-Path -LiteralPath $resolvedPath -PathType Container) {
+                if ($resolvedPath) {
                     if (Measure-AndClear $resolvedPath -Category $appsubcat) { $total++ }
                 }
             }
@@ -661,6 +855,13 @@ function Clear-AppCaches {
 function Clear-DevCaches {
     [CmdletBinding()]
     param()
+    # Wildcard patterns must never be pushed through Join-EnvPath: it normalises the
+    # result with [IO.Path]::GetFullPath, which rejects '*' and returns $null. Passing
+    # that $null to Expand-WildcardPath's mandatory [string] parameter threw a
+    # *terminating* error, aborting this function before the definitions loop below ever
+    # ran. Build the wildcard entries from the resolved parent instead, and skip any
+    # entry that still failed to resolve so one missing variable cannot sink the arm.
+    $tempRoot = Join-EnvPath 'LOCALAPPDATA' 'Temp'
     $devDirs = @(
         (Join-EnvPath 'LOCALAPPDATA' 'npm' '_logs'),
         (Join-EnvPath 'LOCALAPPDATA' 'pip' 'Cache'),
@@ -669,19 +870,20 @@ function Clear-DevCaches {
         (Join-EnvPath 'LOCALAPPDATA' 'LOCALAPPDATA' 'pip' 'Cache'),
         (Join-EnvPath 'LOCALAPPDATA' 'dotnet' 'NuGet' 'v2' 'http-cache'),
         (Join-EnvPath 'APPDATA' 'Code' 'Cache'),
-        (Join-EnvPath 'LOCALAPPDATA' 'Temp' 'npm-*'),
-        (Join-EnvPath 'LOCALAPPDATA' 'Temp' 'yarn-*'),
+        $(if ($tempRoot) { Join-Path $tempRoot 'npm-*' }),
+        $(if ($tempRoot) { Join-Path $tempRoot 'yarn-*' }),
         (Join-EnvPath 'USERPROFILE' '.android' 'cache')
     )
     $cat = 'Dev Caches'; $n = 0
     foreach ($d in $devDirs) {
+        if (-not $d) { continue }
         foreach ($path in @(Expand-WildcardPath -Path $d -DirectoriesOnly)) {
-            if (Measure-AndClear $path -Category $cat) { $n++ }
+            if ($path -and (Measure-AndClear $path -Category $cat)) { $n++ }
         }
     }
 
-    # Process devtools-extended app definitions for .local, .cache, scoop, cargo, android, go, bun
-    $extendedDefs = Get-AppDefinitions -Category 'devtools-extended' | Where-Object { $_.Category -eq 'Dev Caches' }
+    # Process every Dev Caches app definition across app-definitions/*.json
+    $extendedDefs = Get-AllAppDefinitions -Category 'Dev Caches'
     foreach ($app in $extendedDefs) {
         if (-not $app.Name) { continue }
         try {
@@ -693,8 +895,19 @@ function Clear-DevCaches {
             $expandedPath = $expandedPath -replace '{systemdrive}',$env:SYSTEMDRIVE
             $expandedPath = $expandedPath -replace '{windows}',$env:WINDIR
 
+            # Entry-mode locations hold disposable leftovers, not a cache root. They must
+            # never reach Measure-AndClear: that would clear the container's children,
+            # deleting the tool's own files (the npm prefix holds its shims).
+            if ($app.Mode -eq 'entry') {
+                if ($app.EntryPatterns) {
+                    $n += Clear-TransientEntries -Directory $expandedPath -Patterns @($app.EntryPatterns) `
+                        -EntryType $app.EntryType -MinAgeDays (Get-TransientAgeDays -Override $app.MinAgeDays) -Category $cat
+                }
+                continue
+            }
+
             foreach ($resolvedPath in @(Expand-WildcardPath -Path $expandedPath -DirectoriesOnly)) {
-                if (Test-Path -LiteralPath $resolvedPath -PathType Container) {
+                if ($resolvedPath) {
                     if (Measure-AndClear $resolvedPath -Category "$cat - $($app.Name)") { $n++ }
                 }
             }
@@ -725,6 +938,14 @@ function Clear-GpuAndShellCaches {
 function Clear-RecycleBinSafe {
     [CmdletBinding()]
     param()
+    if ($script:Planning) {
+        try {
+            foreach ($directory in @(Get-ChildItem -LiteralPath 'C:\$Recycle.Bin' -Directory -Force -ErrorAction Stop)) {
+                $null = Measure-AndClear -Path $directory.FullName -Category 'Recycle Bin'
+            }
+        } catch { Register-CleanupError -Path 'C:\$Recycle.Bin' -Category 'Recycle Bin' -Message $_.Exception.Message }
+        return $true
+    }
     try {
         $recycleBin = 0
         if (-not $script:IsPreview) {
@@ -741,15 +962,19 @@ function Clear-RecycleBinSafe {
 function Clear-SystemLogFiles {
     [CmdletBinding()]
     param()
+    # Windows event logs and C:\Windows\Logs are diagnostics, not junk. Deleting them
+    # destroys forensic history and WEF continuity, and the live .evtx files are protected
+    # only by an OS file lock, so a partial delete is the normal outcome. Retention is a
+    # user decision; report these as retained instead of clearing them.
+    Register-SkippedItem -Reason 'Windows event logs and C:\Windows\Logs are retained as diagnostics' -Target "$env:SystemRoot\System32\winevt\Logs"
+    Register-SkippedItem -Reason 'Windows event logs and C:\Windows\Logs are retained as diagnostics' -Target "$env:SystemRoot\Logs"
     $logDirs = @(
-        "$env:SystemRoot\Logs",
-        "$env:SystemRoot\System32\winevt\Logs",
         (Join-EnvPath 'LOCALAPPDATA' 'Microsoft' 'Windows' 'WebCache'),
         (Join-EnvPath 'LOCALAPPDATA' 'Microsoft' 'Windows' 'IECompatCache')
     )
     $cat = 'Log Files'; $n = 0
     foreach ($logDir in $logDirs) {
-        if ($logDir -and (Measure-AndClear $logDir -EnsureDirectory -Category $cat)) { $n++ }
+        if ($logDir -and (Measure-AndClear $logDir -Category $cat)) { $n++ }
     }
     return $n
 }
@@ -757,10 +982,10 @@ function Clear-SystemLogFiles {
 function Remove-EmptyDirectories {
     [CmdletBinding()]
     param([AllowEmptyString()][string]$RootPath)
-    if (-not [Bakunawa.Scanner]::IsAllowedPath($RootPath) -or -not (Test-Path -LiteralPath $RootPath -PathType Container)) { return }
+    if (-not (Test-CleanupDirectory $RootPath)) { return }
     $resolved = [IO.Path]::GetFullPath($RootPath).TrimEnd('\')
     foreach ($entry in [Bakunawa.Scanner]::Walk($resolved, [string[]]@(Get-CoreExcludedPaths))) {
-        if ($entry.Kind -eq 'Error') { Register-CleanupError -Path $entry.Path -Category 'Empty folders' -Message $entry.Message }
+        if ($entry.Kind -in @('Error','Skipped')) { Register-CleanupError -Path $entry.Path -Category 'Empty folders' -Message $entry.Message }
         if ($entry.Kind -ne 'EmptyDirectory' -or $entry.Path -eq $resolved -or -not $entry.Complete) { continue }
         try {
             $null = Remove-ItemSafely -Path $entry.Path -Reason 'Empty temp folder' -Preview:$script:IsPreview
@@ -793,15 +1018,23 @@ function Clear-CachedOrphans {
     $isDryRun = $Preview -or $script:IsPreview
     $totalSize = 0L; $count = 0
     foreach ($orphan in @($script:OrphanCache)) {
-        if (-not $orphan -or -not $orphan.SafeDelete) { continue }
+        if (-not $orphan) { continue }
+        if (-not $orphan.SafeDelete -or -not $orphan.EvidenceRule) {
+            Add-CleanupRecord -Path $orphan.Path -Category 'Orphan Scan' -Bytes $orphan.Size -Reason 'no evidence' -Detail $orphan.Reason
+            continue
+        }
         try {
+            $app = $script:OrphanRulePaths[$orphan.Path]
+            if (-not $app -or -not (Test-OrphanEvidence -App $app).Eligible) { throw 'Orphan evidence no longer passes.' }
             $current = [Bakunawa.Scanner]::Inspect($orphan.Path, [string[]]@(Get-ScanExclusions))
             if ($current.Bytes -ne $orphan.Size -or $current.LatestWriteUtc -ne $orphan.LatestWriteUtc -or $current.Files -ne $orphan.FileCount) {
                 throw 'Target changed since scan; rescan required.'
             }
+            $script:CurrentOrphan = $orphan
             $totalSize += Remove-ItemSafely -Path $orphan.Path -Reason $orphan.Category -Tier $orphan.Tier -DetectorName 'Find-OrphanFolders' -Preview:$isDryRun
             $count++
         } catch { Register-CleanupError -Path $orphan.Path -Category 'Orphan Scan' -Message $_.Exception.Message }
+        finally { $script:CurrentOrphan = $null }
     }
     $script:BytesFreed += $totalSize; $script:TaskBytes += $totalSize; $script:TaskCleared += $count
     if (-not $script:CategorySizes) { $script:CategorySizes = @{} }
@@ -840,13 +1073,15 @@ function Clear-ThumbnailCache {
     param()
     $thumbDir = (Join-EnvPath 'LOCALAPPDATA' 'Microsoft\Windows\Explorer')
     $cat = 'Thumbnail Cache'; $n = 0
-    if (-not [Bakunawa.Scanner]::IsAllowedPath($thumbDir) -or -not (Test-Path -LiteralPath $thumbDir -PathType Container)) { return 0 }
+    if (-not (Test-CleanupDirectory $thumbDir)) { return 0 }
     # Only target the thumbnail DB files; leave other Explorer state (IconCache.db is also here)
-    $files = Get-ChildItem -LiteralPath $thumbDir -File -Force -ErrorAction SilentlyContinue |
-        Where-Object { $_.Name -like 'thumbcache_*.db' -or $_.Name -ieq 'IconCache.db' }
+    try {
+        $files = Get-ChildItem -LiteralPath $thumbDir -File -Force -ErrorAction Stop |
+            Where-Object { $_.Name -like 'thumbcache_*.db' -or $_.Name -ieq 'IconCache.db' }
+    } catch { Register-CleanupError -Path $thumbDir -Category $cat -Message $_.Exception.Message; return 0 }
 
     # Thumbnail cache files (thumbcache_*.db, IconCache.db) are small, safe, and isolated.
-    # Route through quarantine for safety; per-file quarantine adds negligible overhead.
+    # Explorer rebuilds them on demand, so a permanent delete is the right trade here.
     foreach ($f in $files) {
         if (Test-IsExcludedPath $f.FullName) { continue }
         $sz = $f.Length
@@ -874,11 +1109,15 @@ function Invoke-CleanupRun {
     )
     
     $script:BytesFreed = 0L
-    $script:QuarantinedBytes = 0L
     $script:CategorySizes = @{}
     $script:Errors = @()
     $script:SkippedItems = @()
-    $script:IsPreview = ($WhatIf.IsPresent -or ($Mode -eq 'Preview'))
+    $preview = ($WhatIf.IsPresent -or ($Mode -eq 'Preview'))
+    $script:IsPreview = $true
+    $script:Planning = $true
+    $script:ActiveCategory = 'Discovery'
+    $script:CandidateRecords = [Collections.Generic.List[object]]::new()
+    try {
     $effectiveMode = if ($Mode -eq 'Preview') { 'Standard' } else { $Mode }
     
     # Load config if not provided
@@ -892,10 +1131,10 @@ function Invoke-CleanupRun {
         }
     }
 
-    Initialize-CleanupState -Config $Config
+    Initialize-CleanupState -Config $Config -Aggressive:($effectiveMode -eq 'Aggressive')
     $Config = $script:CleanupConfig
-    $script:IsPreview = ($script:IsPreview -or [bool]$Config.cleanupMode.dryRun)
-    
+    $preview = ($preview -or [bool]$Config.cleanupMode.dryRun)
+
     # Get tasks based on mode
     $tasks = Get-CleanupTasks -Mode $effectiveMode
     
@@ -912,11 +1151,7 @@ function Invoke-CleanupRun {
     $script:StepIndex = 0
     Reset-CleanupProgress
 
-    $modeNote = if ($script:IsPreview) { 'nothing will be deleted' } else { switch ($Mode) {
-        'Preview'    { 'nothing will be deleted' }
-        'Aggressive' { 'deep clean - files will be deleted' }
-        default      { 'files will be deleted' }
-    } }
+    $modeNote = if ($preview) { 'nothing will be deleted' } else { 'planning, then revalidating and processing eligible candidates' }
     Write-Host ''
     Write-ReviewLine ("Bakunawa - {0}: {1} tasks - {2}" -f $Mode, $tasks.Count, $modeNote)
 
@@ -926,6 +1161,7 @@ function Invoke-CleanupRun {
     # Process tasks
     foreach ($task in $tasks) {
         $taskName = $task.Name
+        $script:ActiveCategory = $taskName
         $isParallel = $task.Parallel
 
         Start-Step -Name $taskName -Total $tasks.Count
@@ -943,10 +1179,6 @@ function Invoke-CleanupRun {
                 # Definitions already point to exact cache directories, including profile tokens.
                 foreach ($app in (Get-AllAppDefinitions -Category 'Browser Caches')) {
                     if (-not $app.Path) { continue }
-                    if (Test-AnyProcessRunning -RunningProcesses $script:RunningProcesses -Names @($app.Process)) {
-                        Register-SkippedItem -Reason 'Close the browser to clean its cache' -Target $app.Name
-                        continue
-                    }
                     foreach ($path in @(Expand-WildcardPath -Path $app.Path -DirectoriesOnly)) {
                         $null = Measure-AndClear -Path $path -Category 'Browser Caches'
                     }
@@ -1000,7 +1232,7 @@ function Invoke-CleanupRun {
                      if ($app.Path) {
                          $expandedPath = $app.Path -replace '{username}',$env:USERNAME -replace '{appdata}', $env:APPDATA -replace '{localappdata}', $env:LOCALAPPDATA
                          foreach ($resolved in @(Expand-WildcardPath -Path $expandedPath -DirectoriesOnly)) {
-                             if (Test-Path -LiteralPath $resolved -PathType Container) {
+                             if ($resolved) {
                                  Measure-AndClear $resolved -Category 'Cloud Sync' -EA SilentlyContinue | Out-Null
                              }
                          }
@@ -1014,7 +1246,7 @@ function Invoke-CleanupRun {
                      if ($app.Path) {
                          $expandedPath = $app.Path -replace '{username}',$env:USERNAME -replace '{appdata}', $env:APPDATA -replace '{localappdata}', $env:LOCALAPPDATA
                          foreach ($resolved in @(Expand-WildcardPath -Path $expandedPath -DirectoriesOnly)) {
-                             if (Test-Path -LiteralPath $resolved -PathType Container) {
+                             if ($resolved) {
                                  Measure-AndClear $resolved -Category 'Creative Apps' -EA SilentlyContinue | Out-Null
                              }
                          }
@@ -1028,7 +1260,7 @@ function Invoke-CleanupRun {
                      if ($app.Path) {
                          $expandedPath = $app.Path -replace '{username}',$env:USERNAME -replace '{appdata}', $env:APPDATA -replace '{localappdata}', $env:LOCALAPPDATA
                          foreach ($resolved in @(Expand-WildcardPath -Path $expandedPath -DirectoriesOnly)) {
-                             if (Test-Path -LiteralPath $resolved -PathType Container) {
+                             if ($resolved) {
                                  Measure-AndClear $resolved -Category 'Productivity' -EA SilentlyContinue | Out-Null
                              }
                          }
@@ -1042,7 +1274,7 @@ function Invoke-CleanupRun {
                      if ($app.Path) {
                          $expandedPath = $app.Path -replace '{username}',$env:USERNAME -replace '{appdata}', $env:APPDATA -replace '{localappdata}', $env:LOCALAPPDATA
                          foreach ($resolved in @(Expand-WildcardPath -Path $expandedPath -DirectoriesOnly)) {
-                             if (Test-Path -LiteralPath $resolved -PathType Container) {
+                             if ($resolved) {
                                  Measure-AndClear $resolved -Category 'DevOps Tools' -EA SilentlyContinue | Out-Null
                              }
                          }
@@ -1057,26 +1289,26 @@ function Invoke-CleanupRun {
                      (Join-EnvPath 'LOCALAPPDATA' 'VirtualStore')
                  )
                  foreach ($hf in $hiddenFolders) {
-                     if ($hf -and (Test-Path -LiteralPath $hf -PathType Container)) {
+                     if ($hf) {
                          Measure-AndClear $hf -Category 'User Hidden' -EA SilentlyContinue | Out-Null
                      }
                  }
              }
              'Scoop Cache' {
                  $scoopCache = Join-EnvPath 'USERPROFILE' 'scoop\cache'
-                 if ($scoopCache -and (Test-Path -LiteralPath $scoopCache -PathType Container)) {
+                 if ($scoopCache) {
                      Measure-AndClear $scoopCache -Category 'Package Managers' -EA SilentlyContinue | Out-Null
                  }
              }
              'Rust Cargo Cache' {
                  $cargoTarget = Join-EnvPath 'USERPROFILE' '.cargo\registry\cache'
-                 if ($cargoTarget -and (Test-Path -LiteralPath $cargoTarget -PathType Container)) {
+                 if ($cargoTarget) {
                      Measure-AndClear $cargoTarget -Category 'Package Managers' -EA SilentlyContinue | Out-Null
                  }
              }
              'Go Module Cache' {
                  $goModCache = Join-EnvPath 'USERPROFILE' 'go\pkg\mod\cache'
-                 if ($goModCache -and (Test-Path -LiteralPath $goModCache -PathType Container)) {
+                 if ($goModCache) {
                      Measure-AndClear $goModCache -Category 'Package Managers' -EA SilentlyContinue | Out-Null
                  }
              }
@@ -1086,7 +1318,7 @@ function Invoke-CleanupRun {
                      (Join-EnvPath 'LOCALAPPDATA' 'bun\install\cache')
                  )
                  foreach ($bc in $bunCache) {
-                     if ($bc -and (Test-Path -LiteralPath $bc -PathType Container)) {
+                     if ($bc) {
                          Measure-AndClear $bc -Category 'Package Managers' -EA SilentlyContinue | Out-Null
                      }
                  }
@@ -1109,13 +1341,96 @@ function Invoke-CleanupRun {
         Finish-Step -Summary $summary
     }
 
-    $runStopwatch.Stop()
 
+    $script:ActiveCategory = $null
+    foreach ($skip in @(Get-CoreSkippedItems)) {
+        if (@($script:CandidateRecords | Where-Object Path -eq $skip.Target).Count) { continue }
+        Add-CleanupRecord -Path $skip.Target -Category $skip.Category -Bytes $skip.Bytes -Reason (Get-CleanupFailureReason $skip.Reason) -Detail $skip.Reason
+    }
+    $script:Planning = $false
+    $script:IsPreview = $preview
+    $script:ActiveCategory = $null
+    # Select outermost eligible targets once, before any mutation, in both modes.
+    $records = [Collections.Generic.List[object]]::new()
+    $selected = New-TrackedSet
+    foreach ($row in @($script:CandidateRecords | Where-Object Status -eq 'Eligible' | Sort-Object { $_.Path.Length })) {
+        $ancestor = $row.Path; $covered = $false
+        while ($ancestor) {
+            if ($selected.Contains($ancestor)) { $covered = $true; break }
+            $ancestor = [IO.Path]::GetDirectoryName($ancestor)
+        }
+        if ($covered) { continue }
+        [void]$selected.Add($row.Path)
+        $records.Add($row)
+    }
+    $candidates = @($records)
+    # ponytail: skipped parent totals compare planned paths; use ancestor byte totals if huge reports make this costly.
+    foreach ($row in @($script:CandidateRecords | Where-Object Status -eq 'Skipped' | Sort-Object { $_.Path.Length })) {
+        if (@($records | Where-Object { $_.Path -eq $row.Path -or [Bakunawa.Scanner]::Within($row.Path, $_.Path) }).Count) { continue }
+        if ($null -ne $row.Bytes) {
+            $covered = [long](($records | Where-Object { [Bakunawa.Scanner]::Within($_.Path, $row.Path) } | Measure-Object Bytes -Sum).Sum)
+            $row.Bytes = [math]::Max(0, $row.Bytes - $covered)
+        }
+        $records.Add($row)
+    }
+    if (-not $preview) {
+        foreach ($row in $candidates) {
+            $script:PartialActedBytes = 0L
+            $script:PartialOutcomeKnown = $true
+            try {
+                Write-ReviewLine ("Processing: {0}" -f $row.Path) -ForegroundColor Gray
+                if ($row.Finding) {
+                    $app = $script:OrphanRulePaths[$row.Path]
+                    if (-not $row.Finding.EvidenceRule -or -not $app -or -not (Test-OrphanEvidence -App $app).Eligible) { throw 'No evidence: orphan rule no longer passes.' }
+                }
+                $current = [Bakunawa.Scanner]::Inspect($row.Path, [string[]]@(Get-CoreExcludedPaths))
+                if ($current.Bytes -ne $row.Measurement.Bytes -or $current.Files -ne $row.Measurement.Files -or $current.LatestWriteUtc -ne $row.Measurement.LatestWriteUtc) { throw 'Changed since scan; rescan required.' }
+                $runningNow = Get-RunningProcessNames
+                foreach ($app in $script:DefinitionPaths) {
+                    if (-not $app.Process -or -not (Test-AnyProcessRunning -RunningProcesses $runningNow -Names @($app.Process))) { continue }
+                    if ([Bakunawa.Scanner]::Within($row.Path, $app.Path) -or [Bakunawa.Scanner]::Within($app.Path, $row.Path)) { throw "In use: $($app.Name)" }
+                }
+                $row.ActedBytes = Remove-ItemSafely -Path $row.Path -Reason $row.Category -Tier $row.Tier -DetectorName $row.Detector
+                $row.Status = 'Acted'
+            } catch {
+                $row.ActedBytes = $script:PartialActedBytes
+                $row.OutcomeKnown = $script:PartialOutcomeKnown
+                $row.Status = 'Skipped'; $row.Detail = $_.Exception.Message
+                $row.Reason = Get-CleanupFailureReason $row.Detail
+                Register-CleanupError -Path $row.Path -Category $row.Category -Message $row.Detail
+            }
+        }
+    }
+    $categoryReport = @(foreach ($group in @($records | Group-Object Category)) {
+        $identified = [long](($group.Group | Measure-Object Bytes -Sum).Sum)
+        $acted = [long](($group.Group | Measure-Object ActedBytes -Sum).Sum)
+        $unknownOutcomes = @($group.Group | Where-Object { -not $_.OutcomeKnown }).Count
+        $reasons = @(foreach ($reason in @($group.Group | Where-Object { $_.Status -ne 'Acted' } | Group-Object { if ($_.Reason) { $_.Reason } else { 'preview' } })) {
+            [pscustomobject]@{ Reason = $reason.Name; Bytes = $(if (@($reason.Group | Where-Object { -not $_.OutcomeKnown }).Count) { $null } else { [long](($reason.Group | Measure-Object Bytes -Sum).Sum) - [long](($reason.Group | Measure-Object ActedBytes -Sum).Sum) }); UnknownSizePaths = @($reason.Group | Where-Object { $null -eq $_.Bytes }).Count }
+        })
+        [pscustomobject]@{ Category = $group.Name; IdentifiedBytes = $identified; ActedBytes = $(if ($unknownOutcomes) { $null } else { $acted }); NotActedBytes = $(if ($unknownOutcomes) { $null } else { $identified - $acted }); ConfirmedActedBytes = $acted; Reasons = $reasons; UnknownSizePaths = @($group.Group | Where-Object { $null -eq $_.Bytes }).Count; UnknownOutcomePaths = $unknownOutcomes }
+    })
+    foreach ($task in $tasks) {
+        if ($task.Name -notin @($categoryReport.Category)) {
+            $categoryReport += [pscustomobject]@{ Category = $task.Name; IdentifiedBytes = 0L; ActedBytes = 0L; NotActedBytes = 0L; Reasons = @(); UnknownSizePaths = 0 }
+        }
+    }
+    $script:CategorySizes = @{}
+    foreach ($group in $categoryReport) { $script:CategorySizes[$group.Category] = $(if ($preview) { [long](($candidates | Where-Object Category -eq $group.Category | Measure-Object Bytes -Sum).Sum) } else { $group.ActedBytes }) }
+    $script:BytesFreed = if ($preview) { [long](($candidates | Measure-Object Bytes -Sum).Sum) } else { [long](($records | Measure-Object ActedBytes -Sum).Sum) }
+    $script:RunCleared = if ($preview) { $candidates.Count } else { @($records | Where-Object Status -eq 'Acted').Count }
+    $denied = @($records | Where-Object { $_.Reason -eq 'access denied' })
+
+    $runStopwatch.Stop()
     # Return results
     return [PSCustomObject]@{
         Mode = $Mode
-        BytesFreed = $(if ($script:IsPreview) { [long]$script:BytesFreed } else { [long][math]::Max(0, $script:BytesFreed - $script:QuarantinedBytes) })
-        QuarantinedBytes = [long]$script:QuarantinedBytes
+        Candidates = $candidates
+        Outcomes = @($records)
+        CategoryReport = $categoryReport
+        UnknownOutcomePaths = @($records | Where-Object { -not $_.OutcomeKnown }).Count
+        IsComplete = ($denied.Count -eq 0 -and @($records | Where-Object { $null -eq $_.Bytes -or -not $_.OutcomeKnown }).Count -eq 0 -and (-not $script:LastScanReport -or $script:LastScanReport.IsComplete))
+        BytesFreed = [long]$script:BytesFreed
         IsPreview = [bool]$script:IsPreview
         PathsCleared = [int]$script:RunCleared
         CategorySizes = $script:CategorySizes
@@ -1125,90 +1440,23 @@ function Invoke-CleanupRun {
         ScanReport = $script:LastScanReport
         DurationSec = [math]::Round($runStopwatch.Elapsed.TotalSeconds, 1)
     }
+    } finally { $script:Planning = $false; $script:ActiveCategory = $null; $script:CurrentOrphan = $null }
 }
 
-function Clear-GameCaches {
+function Clear-DefinitionCaches {
     [CmdletBinding()]
-    param()
-    Write-CommandLog 'SCAN' 'Game Platform Caches'
-    $cat = 'Game Caches'; $n = 0
-    
-    # Version directories contain installed executables; only their client cache is disposable.
-    foreach ($cache in @(Expand-WildcardPath -Path (Join-EnvPath 'LOCALAPPDATA' 'Roblox/Versions/*/ClientCache') -DirectoriesOnly)) {
-        if (Measure-AndClear $cache -Category $cat) { $n++ }
-    }
-    
-    # Steam shader cache (structure: steamapps\shadercache\)
-    $steamRoot = Join-EnvPath 'PROGRAMFILES' 'Steam'
-    if ($steamRoot -and (Test-Path -LiteralPath $steamRoot -PathType Container)) {
-        $shaderCache = Join-Path $steamRoot 'steamapps\shadercache'
-        if (Test-Path -LiteralPath $shaderCache -PathType Container) {
-            if (Measure-AndClear $shaderCache -Category $cat) { $n++ }
+    param([string]$Category)
+    $count = 0
+    foreach ($app in @(Get-AllAppDefinitions -Category $Category)) {
+        foreach ($path in @(Expand-WildcardPath -Path $app.Path -DirectoriesOnly)) {
+            if (Measure-AndClear -Path $path -Category $Category) { $count++ }
         }
     }
-    
-    # Epic Games Launcher cache
-    $epicCache = Join-EnvPath 'PROGRAMDATA' 'Epic\UnrealEngineLauncher\Saved\Cache'
-    if ($epicCache -and (Test-Path -LiteralPath $epicCache -PathType Container)) {
-        if (Measure-AndClear $epicCache -Category $cat) { $n++ }
-    }
-    
-    # Battle.net cache
-    $battleNetCache = Join-EnvPath 'PROGRAMDATA' 'Battle.net\Cache'
-    if ($battleNetCache -and (Test-Path -LiteralPath $battleNetCache -PathType Container)) {
-        if (Measure-AndClear $battleNetCache -Category $cat) { $n++ }
-    }
-    
-    # Roblox Player cache (user-level)
-    $robloxPlayer = Join-EnvPath 'LOCALAPPDATA' 'Roblox\cache'
-    if ($robloxPlayer -and (Test-Path -LiteralPath $robloxPlayer -PathType Container)) {
-        if (Measure-AndClear $robloxPlayer -Category $cat) { $n++ }
-    }
-    
-    return $n
+    return $count
 }
 
-function Clear-BrowserAutomationCaches {
-    [CmdletBinding()]
-    param()
-    Write-CommandLog 'SCAN' 'Browser Automation Tool Caches'
-    $cat = 'Dev Tools'; $n = 0
-    
-    # Playwright cache (downloads browsers & dependencies)
-    $playwrightCache = @(
-        (Join-EnvPath 'LOCALAPPDATA' 'ms-playwright'),
-        (Join-EnvPath 'USERPROFILE' '.cache\ms-playwright')
-    )
-    foreach ($pc in $playwrightCache) {
-        if ($pc -and (Test-Path -LiteralPath $pc -PathType Container)) {
-            if (Measure-AndClear $pc -Category $cat) { $n++ }
-        }
-    }
-    
-    # Puppeteer cache (downloads Chromium)
-    $puppeteerCache = @(
-        (Join-EnvPath 'USERPROFILE' '.puppeteer'),
-        (Join-EnvPath 'LOCALAPPDATA' 'puppeteer')
-    )
-    foreach ($pc in $puppeteerCache) {
-        if ($pc -and (Test-Path -LiteralPath $pc -PathType Container)) {
-            if (Measure-AndClear $pc -Category $cat) { $n++ }
-        }
-    }
-    
-    # Selenium cache
-    $seleniumCache = @(
-        (Join-EnvPath 'LOCALAPPDATA' 'SeleniumHQ'),
-        (Join-EnvPath 'USERPROFILE' '.selenium')
-    )
-    foreach ($sc in $seleniumCache) {
-        if ($sc -and (Test-Path -LiteralPath $sc -PathType Container)) {
-            if (Measure-AndClear $sc -Category $cat) { $n++ }
-        }
-    }
-    
-    return $n
-}
+function Clear-GameCaches { Clear-DefinitionCaches -Category 'Game Caches' }
+function Clear-BrowserAutomationCaches { Clear-DefinitionCaches -Category 'Browser Automation Caches' }
 
 function Clear-PackageManagerCaches {
     [CmdletBinding()]
@@ -1216,10 +1464,12 @@ function Clear-PackageManagerCaches {
     Write-CommandLog 'SCAN' 'Package Manager Caches'
     $cat = 'Dev Caches'; $n = 0
     
-    # npm cache
-    $npmCache = Join-EnvPath 'APPDATA' 'npm-cache'
-    if ($npmCache -and (Test-Path -LiteralPath $npmCache -PathType Container)) {
-        if (Measure-AndClear $npmCache -Category $cat) { $n++ }
+    # npm cache: resolved from the app definition so one source of truth drives the
+    # path. npm 5+ writes %LOCALAPPDATA%\npm-cache; legacy installs used %APPDATA%.
+    foreach ($npmCache in @(Get-AllAppDefinitions -Category 'Dev Caches' |
+            Where-Object { $_.Name -eq 'npm-cache' -and $_.Mode -ne 'entry' } |
+            ForEach-Object { $_.Path })) {
+        if ($npmCache -and (Measure-AndClear $npmCache -Category $cat)) { $n++ }
     }
     
     # pip cache (Python)
@@ -1228,7 +1478,7 @@ function Clear-PackageManagerCaches {
         (Join-EnvPath 'USERPROFILE' 'AppData\Local\pip\Cache')
     )
     foreach ($pc in $pipCache) {
-        if ($pc -and (Test-Path -LiteralPath $pc -PathType Container)) {
+        if ($pc) {
             if (Measure-AndClear $pc -Category $cat) { $n++ }
         }
     }
@@ -1239,7 +1489,7 @@ function Clear-PackageManagerCaches {
         (Join-EnvPath 'LOCALAPPDATA' 'huggingface\cache')
     )
     foreach ($hc in $hfCache) {
-        if ($hc -and (Test-Path -LiteralPath $hc -PathType Container)) {
+        if ($hc) {
             if (Measure-AndClear $hc -Category $cat) { $n++ }
         }
     }
@@ -1253,6 +1503,9 @@ Export-ModuleMember -Function @(
     'Get-CleanupPotential',
     'Remove-FilesByPattern',
     'Expand-WildcardPath',
+    'Get-TransientEntryMatches',
+    'Clear-TransientEntries',
+    'Get-TransientAgeDays',
     'Clear-SystemCaches',
     'Clear-ChromiumCaches',
     'Clear-FirefoxCaches',

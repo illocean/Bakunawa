@@ -1,0 +1,53 @@
+[
+  {
+    "name": "Playwright",
+    "process": [
+      "node",
+      "chrome",
+      "firefox",
+      "headless_shell"
+    ],
+    "category": "Browser Automation Caches",
+    "locations": [
+      {
+        "env": "LOCALAPPDATA",
+        "path": "ms-playwright"
+      },
+      {
+        "env": "USERPROFILE",
+        "path": ".cache/ms-playwright"
+      }
+    ]
+  },
+  {
+    "name": "Puppeteer",
+    "process": [
+      "node",
+      "chrome",
+      "headless_shell"
+    ],
+    "category": "Browser Automation Caches",
+    "locations": [
+      {
+        "env": "USERPROFILE",
+        "path": ".cache/puppeteer"
+      }
+    ]
+  },
+  {
+    "name": "Selenium",
+    "process": [
+      "selenium",
+      "chromedriver",
+      "geckodriver",
+      "msedgedriver"
+    ],
+    "category": "Browser Automation Caches",
+    "locations": [
+      {
+        "env": "USERPROFILE",
+        "path": ".cache/selenium"
+      }
+    ]
+  }
+]

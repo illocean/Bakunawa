@@ -1,7 +1,7 @@
 ﻿#requires -Version 5.1
 BeforeAll {
     $repo = (Resolve-Path "$PSScriptRoot/..").Path
-    foreach ($module in @('Core','Config','Quarantine','Cleanup','UI')) {
+    foreach ($module in @('Core','Config','Cleanup','UI')) {
         Import-Module "$repo/src/Bakunawa.$module.psm1" -Force -DisableNameChecking
     }
 }
@@ -28,7 +28,7 @@ Describe 'Command-line mode routing' {
         Mock Invoke-CleanupRun {
             param($Mode)
             [pscustomobject]@{ Mode = $Mode; IsPreview = ($Mode -eq 'Preview'); DurationSec = 0;
-                PathsCleared = 0; BytesFreed = 0; QuarantinedBytes = 0; Errors = @();
+                PathsCleared = 0; BytesFreed = 0; Errors = @();
                 SkippedItems = @(); CategorySizes = @{}; ScanReport = $null }
         }
         & (Get-Module Bakunawa.UI) { $script:LogFilePath = $null; $script:ScanLogPath = $null }
@@ -37,7 +37,6 @@ Describe 'Command-line mode routing' {
     It 'runs the <RunMode> entry point through automatic logging' -TestCases @(
         @{ RunMode = 'Standard'; Expected = 'CLEANUP SUMMARY' },
         @{ RunMode = 'Aggressive'; Expected = 'CLEANUP SUMMARY' },
-        @{ RunMode = 'Preview'; Expected = 'PREVIEW SUMMARY' },
         @{ RunMode = 'Scan'; Expected = 'SCAN SUMMARY' },
         @{ RunMode = 'Health'; Expected = 'Fixture health summary' },
         @{ RunMode = 'Benchmark'; Expected = 'BENCHMARK SUMMARY' }
@@ -54,25 +53,18 @@ Describe 'Command-line mode routing' {
 }
 
 Describe 'Runtime report scope respects configuration' {
-    It 'retains configured exclusions and disabled tasks after quarantine helpers read configuration' {
+    It 'retains configured exclusions and disabled tasks after config helpers read configuration' {
         Import-Module "$repo/src/Bakunawa.Config.psm1" -Force -DisableNameChecking
-        Import-Module "$repo/src/Bakunawa.Quarantine.psm1" -Force -DisableNameChecking
         $cfg = Get-DefaultConfig
         $cfg.taskCategories['System Caches'].enabled = $false
         $cfg.exclusions.userCustomExclusions = @((Join-Path $TestDrive 'protected'))
-        $cfg.quarantineRoot = Join-Path $TestDrive 'custom-quarantine'
-        $cfg.behaviorSettings.quarantineBeforeDelete = $true
-        $cfg.behaviorSettings.deleteQuarantineAfterDays = 27
         $configFile = Join-Path $TestDrive 'scope-config.json'
         $cfg | ConvertTo-Json -Depth 15 | Set-Content -LiteralPath $configFile -Encoding UTF8
         Initialize-ConfigModule -ConfigPath $configFile
         $loaded = Get-UserConfig
         $loaded.taskCategories['System Caches'].enabled | Should -BeFalse
-        Get-QuarantineRoot | Should -Be $cfg.quarantineRoot
-        Get-QuarantineRetentionDays | Should -Be 27
         (Get-UserConfig).taskCategories['System Caches'].enabled | Should -BeFalse
         (Get-UserConfig).exclusions.userCustomExclusions | Should -Contain $cfg.exclusions.userCustomExclusions[0]
-        Test-Path -LiteralPath $cfg.quarantineRoot | Should -BeFalse
     }
 }
 
@@ -95,7 +87,7 @@ Describe 'Interactive menu report lifecycle' {
             Mock Invoke-CleanupRun {
                 param($Mode)
                 [pscustomobject]@{ Mode = $Mode; IsPreview = ($Mode -eq 'Preview'); DurationSec = 0;
-                    PathsCleared = 0; BytesFreed = 0; QuarantinedBytes = 0; Errors = @();
+                    PathsCleared = 0; BytesFreed = 0; Errors = @();
                     SkippedItems = @(); CategorySizes = @{}; ScanReport = $null }
             }
             Mock Find-OrphanFolders { @() }
@@ -103,7 +95,7 @@ Describe 'Interactive menu report lifecycle' {
             Mock Show-HealthDetail { Write-ReviewLine 'Fixture health summary' }
             Show-Menu
             $logs = @(Get-ChildItem -LiteralPath (Join-Path $FixtureRoot 'menu-logs') -Filter *.txt)
-            $logs.Count | Should -Be 6
+            $logs.Count | Should -Be 5
             @($logs | Where-Object Name -Like '*-Scan-*').Count | Should -Be 2
             foreach ($log in $logs) { (Get-Content -LiteralPath $log.FullName -Raw) | Should -Match 'RUN FINISHED' }
         }
@@ -123,7 +115,7 @@ Describe 'Automatic text reports and terminal layout' {
     }
 
     It 'exports a readable automatic text log for <RunMode>' -TestCases @(
-        @{ RunMode = 'Standard' }, @{ RunMode = 'Aggressive' }, @{ RunMode = 'Preview' },
+        @{ RunMode = 'Standard' }, @{ RunMode = 'Aggressive' },
         @{ RunMode = 'Scan' }, @{ RunMode = 'Health' }, @{ RunMode = 'Benchmark' }
     ) {
         param($RunMode)
@@ -142,12 +134,12 @@ Describe 'Automatic text reports and terminal layout' {
     }
 
     It 'keeps repeated runs separate and shares a log with nested scans' {
-        Invoke-LoggedOperation -Mode Preview -Action {
+        Invoke-LoggedOperation -Mode Standard -Action {
             Invoke-LoggedOperation -Mode Scan -Action { Write-ReviewLine 'Nested discovery' }
         }
         $first = Get-ScanLogPath
         $original = Get-Content -LiteralPath $first -Raw
-        Invoke-LoggedOperation -Mode Preview -Action { Write-ReviewLine 'Second run' }
+        Invoke-LoggedOperation -Mode Standard -Action { Write-ReviewLine 'Second run' }
         (Get-ScanLogPath) | Should -Not -Be $first
         @(Get-ChildItem -LiteralPath $logRoot -Filter *.txt).Count | Should -Be 2
         (Get-Content -LiteralPath $first -Raw) | Should -Be $original
@@ -237,7 +229,7 @@ Describe 'Automatic text reports and terminal layout' {
         $output | Should -Match 'Local disk C: only'
         $output | Should -Match 'DATA BY CATEGORY / largest first'
         $output | Should -Match 'Showing the largest 10 of 14'
-        $output | Should -Match 'Showing 5 of 7 issues'
+        $output | Should -Match 'locked-7'
         $output | Should -Not -Match 'candidate-14.tmp'
         $log = Get-Content -LiteralPath (Get-ScanLogPath) -Raw
         foreach ($finding in $findings) { $log | Should -Match ([regex]::Escape($finding.Path)) }
@@ -246,20 +238,20 @@ Describe 'Automatic text reports and terminal layout' {
         $log | Should -Match 'CONFIGURED EXCLUSIONS'
     }
 
-    It 'keeps estimates distinct from deleted and quarantined data' {
+    It 'keeps preview estimates distinct from permanently deleted data' {
         Mock -ModuleName Bakunawa.UI Set-UiContext {}
         $result = [pscustomobject]@{ Mode = 'Preview'; IsPreview = $true; DurationSec = 2;
-            PathsCleared = 1; BytesFreed = 4096; QuarantinedBytes = 0; Errors = @();
+            PathsCleared = 1; BytesFreed = 4096; Errors = @();
             SkippedItems = @(); CategorySizes = @{ Cache = 4096 }; ScanReport = $null }
         $preview = Show-CleanupResult $result 6>&1 | Out-String
         $preview | Should -Match 'Estimated eligible data'
-        $preview | Should -Match 'No files were deleted or moved'
+        $preview | Should -Match 'No files were deleted'
         $preview | Should -Not -Match 'Deleted data\s*:'
-        $result.Mode = 'Standard'; $result.IsPreview = $false; $result.QuarantinedBytes = 2048
+        $result.Mode = 'Standard'; $result.IsPreview = $false
         $cleanup = Show-CleanupResult $result 6>&1 | Out-String
         $cleanup | Should -Match 'Deleted data\s*: 4 KB'
-        $cleanup | Should -Match 'Quarantined data\s*: 2 KB'
-        $cleanup | Should -Match 'still uses disk space'
+        $cleanup | Should -Not -Match 'Quarantined data'
+        $cleanup | Should -Match 'Deletion is permanent'
     }
 
     It 'displays a single scan issue without an empty hidden-issue count' {

@@ -36,28 +36,10 @@ Import-Module (Join-Path $moduleDir 'Bakunawa.Config.psm1') -Force -Scope Global
 Import-Module (Join-Path $moduleDir 'Bakunawa.Runspace.psm1') -Force -Scope Global -ErrorAction Stop -WarningAction SilentlyContinue
 Import-Module (Join-Path $moduleDir 'Bakunawa.Cleanup.psm1') -Force -Scope Global -ErrorAction Stop -WarningAction SilentlyContinue
 Import-Module (Join-Path $moduleDir 'Bakunawa.UI.psm1') -Force -Scope Global -ErrorAction Stop -WarningAction SilentlyContinue
-Import-Module (Join-Path $moduleDir 'Bakunawa.Quarantine.psm1') -Force -Scope Global -ErrorAction Stop -WarningAction SilentlyContinue
 
 function Show-RunSummary {
     param([PSCustomObject]$Result)
     Show-CleanupResult -Result $Result
-}
-
-function Test-IsWSL {
-    try {
-        $isWSL = Get-Process -Name 'wsl' -EA SilentlyContinue
-        Write-Verbose "Test-IsWSL: probing WSL environment"
-        if ($isWSL) { return $true } else { return $false }
-    } catch {
-        Write-Verbose "Test-IsWSL: could not probe, assuming Windows"
-        return $false
-    }
-}
-
-function Convert-ToWindowsPath {
-    param([string]$Path)
-    if ([string]::IsNullOrWhiteSpace($Path)) { return $null }
-    return $Path.Replace('/', '\')
 }
 
 function Test-IsAdministrator {
@@ -118,14 +100,18 @@ if (-not $SkipBootstrap) {
         if (Test-Path -LiteralPath $profilePath) {
             try {
                 $profileConfig = Get-Content -LiteralPath $profilePath -Raw -Encoding UTF8 | ConvertFrom-Json -ErrorAction Stop
-                if ($profileConfig.mode) {
+                if ($profileConfig.aggressive -and $null -ne $profileConfig.aggressive.enabled -and $profileConfig.aggressive.enabled -isnot [bool]) {
+                    throw 'Profile aggressive.enabled must be a JSON boolean.'
+                }
+                if ($profileConfig.mode -and -not $PSBoundParameters.ContainsKey('Mode')) {
                     if ($profileConfig.mode -in $validModes) {
                         $Mode = $profileConfig.mode
                     } else {
                         Write-Host "Profile specifies invalid mode: '$($profileConfig.mode)'. Using '$Mode'." -ForegroundColor Yellow
                     }
                 }
-                if ($profileConfig.aggressive -and $profileConfig.aggressive.enabled) { $script:IsAggressive = $true }
+                # The flag chooses Aggressive only when the caller did not specify a mode.
+                if (-not $PSBoundParameters.ContainsKey('Mode') -and $profileConfig.aggressive.enabled) { $Mode = 'Aggressive' }
             } catch {
                 Write-Host "Failed to load profile '$Profile': $($_.Exception.Message)" -ForegroundColor Red
                 exit 1
@@ -150,11 +136,10 @@ if (-not $SkipBootstrap) {
         exit 0
     }
 
-    if ($VerboseScan) { $script:VerboseScan = $true }
     if ($ExtraExcludePath) { $script:ExtraExcludePaths = $ExtraExcludePath }
     
     # Validate and set log file path (explicit single-writer contract via UI module)
-    if ($LogFile) {
+    if ($LogFile -and $Mode -ne 'Preview') {
         try {
             $null = Initialize-UiLogging -Path $LogFile
         } catch {
@@ -172,7 +157,7 @@ if (-not $SkipBootstrap) {
     if ($config.extraExcludePaths) { $extraExclusions += $config.extraExcludePaths }
     if ($script:ExtraExcludePaths) { $extraExclusions += $script:ExtraExcludePaths }
 
-    Initialize-CleanupState -Config $config -ScanRoot $ScanRoot -ExtraExcludePath $extraExclusions
+    Initialize-CleanupState -Config $config -ScanRoot $ScanRoot -ExtraExcludePath $extraExclusions -VerboseScan:$VerboseScan -Aggressive:($Mode -eq 'Aggressive')
     Set-UiContext -Mode $Mode
     Set-UiOptions -NoAnimations:$NoAnimations
 
@@ -196,7 +181,7 @@ if (-not $SkipBootstrap) {
             $report = Get-OrphanScanReport
             Show-OrphanScanResults -ScanResult $report
             if ($ReportPath) {
-                $report | ConvertTo-Json -Depth 8 | Out-File -LiteralPath $ReportPath -Encoding UTF8 -NoClobber -ErrorAction Stop
+                Export-ScanReport -Report $report -Path $ReportPath
                 Write-ReviewLine "Report saved: $ReportPath"
             }
         }

@@ -27,7 +27,6 @@ $script:LastOrphanRisks  = $null
 $script:OrphanCache      = $null
 $script:OrphanCacheTime  = $null
 $script:SysLoc           = $null
-$script:UseQuarantine    = $true
 $script:InstalledAppNames = $null
 
 function Get-FreeSpaceInfo {
@@ -188,10 +187,28 @@ function Restart-Elevated {
     }
 }
 
+function Get-ProtectedKnownFolders {
+    [CmdletBinding()]
+    param()
+    foreach ($id in @(
+        'B4BFCC3A-DB2C-424C-B029-7FE99A87C641', # Desktop
+        'FDD39AD0-238F-46AF-ADB4-6C85480369C7', # Documents
+        '374DE290-123F-4565-9164-39C4925E467B', # Downloads
+        '33E28130-4E1E-4676-835A-98395C3BC3BB', # Pictures
+        '18989B1D-99B5-455B-841C-AB7C74E4DDFC', # Videos
+        '4BD8D571-6D19-48D3-BE97-422220080E43'  # Music
+    )) {
+        $path = [Bakunawa.Scanner]::KnownFolder($id)
+        if (-not $path) { throw "Cannot resolve protected known folder $id; cleanup is blocked." }
+        [IO.Path]::GetFullPath($path).TrimEnd('\')
+    }
+}
+
 function Get-ExcludedPaths {
     [CmdletBinding()]
     param([string[]]$ExtraExcludePath)
     $set = New-TrackedSet
+    foreach ($path in @(Get-ProtectedKnownFolders)) { [void]$set.Add([IO.Path]::GetFullPath($path).TrimEnd('\')) }
     $standardFolders = @('Downloads','Documents','Desktop','Pictures','Videos','Music')
     
     # User profile standard folders (hard exclusion)
@@ -226,6 +243,8 @@ function Get-ExcludedPaths {
 
 function Get-CoreExcludedPaths {
     if ($null -eq $script:ExcludedPaths) { $script:ExcludedPaths = Get-ExcludedPaths }
+    # Resolve again at mutation time: known-folder redirection can change after scanning.
+    foreach ($path in @(Get-ProtectedKnownFolders)) { [void]$script:ExcludedPaths.Add([IO.Path]::GetFullPath($path).TrimEnd('\')) }
     foreach ($path in $script:ExcludedPaths) { $path }
 }
 
@@ -235,8 +254,8 @@ function Test-IsExcludedPath {
     [CmdletBinding()]
     param([string]$Path)
     $r = Resolve-RealPath $Path
-    if (-not $r -or -not $script:ExcludedPaths) { return $false }
-    foreach ($e in $script:ExcludedPaths) {
+    if (-not $r) { return $false }
+    foreach ($e in @(Get-CoreExcludedPaths)) {
         if ($r.Equals($e,[StringComparison]::OrdinalIgnoreCase) -or
             $r.StartsWith("$e\",[StringComparison]::OrdinalIgnoreCase)) { return $true }
     }
@@ -385,6 +404,7 @@ function Get-InstalledApplicationNames {
     [CmdletBinding()]
     param(
         [switch]$SkipCaching,
+        [switch]$Strict,
         [string[]]$UninstallKeys
     )
 
@@ -406,7 +426,11 @@ function Get-InstalledApplicationNames {
 
     foreach ($keyPath in $UninstallKeys) {
         try {
-            if (-not (Test-Path -LiteralPath $keyPath)) {
+            if (-not (Test-Path -LiteralPath $keyPath -ErrorAction Stop)) {
+                if ($Strict) {
+                    # A readable parent establishes absence; an unreadable parent is inconclusive.
+                    $null = Get-ChildItem -LiteralPath (Split-Path -Parent $keyPath) -ErrorAction Stop
+                }
                 continue
             }
 
@@ -414,7 +438,7 @@ function Get-InstalledApplicationNames {
             foreach ($subKey in $regKey.GetSubKeyNames()) {
                 try {
                     $fullPath = Join-Path $keyPath $subKey
-                    $props = Get-ItemProperty -LiteralPath $fullPath -ErrorAction SilentlyContinue
+                    $props = Get-ItemProperty -LiteralPath $fullPath -ErrorAction Stop
 
                     # Skip entries without DisplayName
                     if (-not $props.DisplayName) {
@@ -433,12 +457,14 @@ function Get-InstalledApplicationNames {
                     [void]$appNames.Add($props.DisplayName.ToLower())
                 }
                 catch {
+                    if ($Strict) { throw }
                     # Skip individual key read errors; continue scanning
                     continue
                 }
             }
         }
         catch {
+            if ($Strict) { throw }
             # Skip entire registry hive read errors; continue to next key
             continue
         }
@@ -474,22 +500,12 @@ function Initialize-CoreSafetyState {
     $script:SysLoc = Get-SystemLocations
     $script:SkippedItems = @()
 
-    # Cache quarantine setting from config; defaults to $true if not provided
-    if ($Config -and $Config.behaviorSettings -and $null -ne $Config.behaviorSettings.quarantineBeforeDelete) {
-        $script:UseQuarantine = [bool]$Config.behaviorSettings.quarantineBeforeDelete
-    } else {
-        $script:UseQuarantine = $true
-    }
+    # Quarantine was removed: every delete is final and immediately reclaims disk space.
+    Write-CommandLog 'INFO' 'Deletes are permanent; use Preview to inspect the plan first.'
 
-    # Log when quarantine is disabled
-    if (-not $script:UseQuarantine) {
-        Write-CommandLog 'WARN' 'Quarantine disabled: deleted files cannot be recovered'
-    }
-    
     return [PSCustomObject]@{
         ExcludedPathCount = if ($script:ExcludedPaths) { $script:ExcludedPaths.Count } else { 0 }
         ProcessCount = if ($script:RunningProcesses) { $script:RunningProcesses.Count } else { 0 }
-        UseQuarantine = $script:UseQuarantine
     }
 }
 
@@ -505,8 +521,8 @@ function Test-AnyProcessRunning {
 
 function Register-SkippedItem {
     [CmdletBinding()]
-    param([string]$Reason, [string]$Target)
-    $script:SkippedItems += [PSCustomObject]@{ Reason = $Reason; Target = $Target }
+    param([string]$Reason, [string]$Target, [string]$Category = 'Discovery', [Nullable[long]]$Bytes)
+    $script:SkippedItems += [PSCustomObject]@{ Reason = $Reason; Target = $Target; Category = $Category; Bytes = $Bytes }
 }
 
 function Get-OrphanRiskScore {
@@ -694,6 +710,44 @@ function Get-SystemLocations {
     return $script:SysLoc
 }
 
+function Get-LocationOptions {
+    [CmdletBinding()]
+    <#
+    .SYNOPSIS
+    Reads the optional per-location fields of an app definition.
+
+    .DESCRIPTION
+    A location names a cache root whose contents are cleared. Setting
+    mode = 'entry' re-reads the location as a container whose matching children
+    are themselves disposable, which is what install-staging leftovers need:
+    the staged entry, not its contents, is the artifact. Absent fields keep the
+    historical contents semantics, so existing definitions are unchanged.
+    #>
+    param([Parameter(Mandatory)][object]$Location)
+
+    $mode = 'contents'
+    if ($Location.PSObject.Properties['mode'] -and $Location.mode) { $mode = [string]$Location.mode }
+
+    $patterns = @()
+    if ($Location.PSObject.Properties['entryPatterns'] -and $Location.entryPatterns) { $patterns = @($Location.entryPatterns) }
+
+    $entryType = 'any'
+    if ($Location.PSObject.Properties['entryType'] -and $Location.entryType) { $entryType = [string]$Location.entryType }
+
+    # 0 means "use the configured scan age"; a positive value overrides it.
+    $minAgeDays = 0
+    if ($Location.PSObject.Properties['minAgeDays'] -and $Location.minAgeDays) {
+        $null = [int]::TryParse([string]$Location.minAgeDays, [ref]$minAgeDays)
+    }
+
+    return [PSCustomObject]@{
+        Mode          = $mode
+        EntryPatterns = $patterns
+        EntryType     = $entryType
+        MinAgeDays    = $minAgeDays
+    }
+}
+
 function Get-AllAppDefinitions {
     [CmdletBinding()]
     <#
@@ -705,7 +759,8 @@ function Get-AllAppDefinitions {
     from every JSON file is returned.
     .OUTPUTS
     Array of app definition objects with Name, Path, Env, Process, Category,
-    and SourceFile properties (flattened from locations).
+    SourceFile, Mode, EntryPatterns, EntryType and MinAgeDays properties
+    (flattened from locations).
     #>
     param([string]$Category)
 
@@ -745,13 +800,19 @@ function Get-AllAppDefinitions {
                     if (-not $envValue) { continue }
 
                     $fullPath = Join-Path $envValue ([string]$loc.path)
+                    $options = Get-LocationOptions -Location $loc
                     $flattened.Add([PSCustomObject]@{
-                        Name       = [string]$app.name
-                        Path       = $fullPath
-                        Env        = [string]$loc.env
-                        Process    = $app.process
-                        Category   = $appCategory
-                        SourceFile = $jf.Name
+                        Name          = [string]$app.name
+                        Path          = $fullPath
+                        Env           = [string]$loc.env
+                        Process       = $app.process
+                        Category      = $appCategory
+                        SourceFile    = $jf.Name
+                        OrphanRule    = $app.orphanRule
+                        Mode          = $options.Mode
+                        EntryPatterns = $options.EntryPatterns
+                        EntryType     = $options.EntryType
+                        MinAgeDays    = $options.MinAgeDays
                     })
                 }
             }
@@ -806,13 +867,18 @@ function Get-AppDefinitions {
                 if (-not $envValue) { continue }
 
                 $fullPath = Join-Path $envValue ([string]$loc.path)
+                $options = Get-LocationOptions -Location $loc
                 $flattened.Add([PSCustomObject]@{
-                    Name       = [string]$app.name
-                    Path       = $fullPath
-                    Env        = [string]$loc.env
-                    Process    = $app.process
-                    Category   = $appCategory
-                    SourceFile = (Split-Path -Leaf $appDefPath)
+                    Name          = [string]$app.name
+                    Path          = $fullPath
+                    Env           = [string]$loc.env
+                    Process       = $app.process
+                    Category      = $appCategory
+                    SourceFile    = (Split-Path -Leaf $appDefPath)
+                    Mode          = $options.Mode
+                    EntryPatterns = $options.EntryPatterns
+                    EntryType     = $options.EntryType
+                    MinAgeDays    = $options.MinAgeDays
                 })
             }
         }
@@ -823,4 +889,4 @@ function Get-AppDefinitions {
     }
 }
 
-Export-ModuleMember -Function Get-CoreSkippedItems, Get-CoreExcludedPaths, Get-FreeSpaceInfo, Get-DirectorySize, Get-DirectorySizeEstimate, Format-FileSize, New-TrackedSet, Resolve-FullPath, Resolve-RealPath, Get-EnvPath, Join-EnvPath, Test-IsAdministrator, Restart-Elevated, Get-ExcludedPaths, Test-IsExcludedPath, Get-DefaultApprovedRoots, Test-SafeCleanupTarget, Get-DisposableDirectoryNames, Test-IsDisposableLogPath, Get-DisposableLogCandidates, Get-StaleDisposableDirectories, Get-JunkSweepRoots, Get-InstalledApplicationNames, Get-RunningProcessNames, Test-AnyProcessRunning, Register-SkippedItem, Get-OrphanRiskScore, Get-HealthScore, Get-AllAppDefinitions, Get-AppDefinitions, Get-SystemLocations, Get-AppLogoLines, Get-ConsoleWidth, Get-DisplayText, Get-PathLabel, Format-CompactList, New-AsciiBar, Initialize-CoreSafetyState
+Export-ModuleMember -Function Get-ProtectedKnownFolders, Get-CoreSkippedItems, Get-CoreExcludedPaths, Get-FreeSpaceInfo, Get-DirectorySize, Get-DirectorySizeEstimate, Format-FileSize, New-TrackedSet, Resolve-FullPath, Resolve-RealPath, Get-EnvPath, Join-EnvPath, Test-IsAdministrator, Restart-Elevated, Get-ExcludedPaths, Test-IsExcludedPath, Get-DefaultApprovedRoots, Test-SafeCleanupTarget, Get-DisposableDirectoryNames, Test-IsDisposableLogPath, Get-DisposableLogCandidates, Get-StaleDisposableDirectories, Get-JunkSweepRoots, Get-InstalledApplicationNames, Get-RunningProcessNames, Test-AnyProcessRunning, Register-SkippedItem, Get-OrphanRiskScore, Get-HealthScore, Get-AllAppDefinitions, Get-AppDefinitions, Get-SystemLocations, Get-AppLogoLines, Get-ConsoleWidth, Get-DisplayText, Get-PathLabel, Format-CompactList, New-AsciiBar, Initialize-CoreSafetyState

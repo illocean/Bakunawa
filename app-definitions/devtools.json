@@ -13,7 +13,8 @@
       { "env": "APPDATA", "path": "Code/Service Worker/CacheStorage" },
       { "env": "APPDATA", "path": "Code/logs" },
       { "env": "APPDATA", "path": "Code/User/History" },
-      { "env": "APPDATA", "path": "Code/User/workspaceStorage" }
+      { "env": "APPDATA", "path": "Code/User/workspaceStorage" },
+      { "env": "USERPROFILE", "path": ".vscode/extensions", "mode": "entry", "entryType": "directory", "entryPatterns": [".*", "*.vsctmp"] }
     ]
   },
   {
@@ -72,7 +73,8 @@
     "category": "Dev Caches",
     "locations": [
       { "env": "LOCALAPPDATA", "path": "pnpm-cache" },
-      { "env": "LOCALAPPDATA", "path": "pnpm-state" }
+      { "env": "LOCALAPPDATA", "path": "pnpm-state" },
+      { "env": "LOCALAPPDATA", "path": "pnpm/store" }
     ]
   },
   {
@@ -98,6 +100,23 @@
     "category": "Dev Caches",
     "locations": [
       { "env": "LOCALAPPDATA", "path": "uv/cache" }
+    ]
+  },
+  {
+    "name": "npm-staging-temps",
+    "process": null,
+    "category": "Dev Caches",
+    "locations": [
+      { "env": "APPDATA", "path": "npm", "mode": "entry", "entryPatterns": [".omniroute-*", ".opencode-ai-*", ".*-????????"] },
+      { "env": "APPDATA", "path": "npm/node_modules", "mode": "entry", "entryPatterns": [".omniroute-*", ".opencode-ai-*", ".*-????????"] }
+    ]
+  },
+  {
+    "name": "opencode-cache",
+    "process": ["opencode"],
+    "category": "Dev Caches",
+    "locations": [
+      { "env": "USERPROFILE", "path": ".cache/opencode" }
     ]
   },
   {

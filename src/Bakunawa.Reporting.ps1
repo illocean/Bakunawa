@@ -2,6 +2,7 @@
 function Write-ScanLogText {
     [CmdletBinding()]
     param([AllowEmptyString()][string]$Text = '')
+    if ($script:ReadOnlyOutput) { return }
     # Keep logs readable even when a path contains terminal control characters.
     $plain = $Text -replace '\x1B\[[0-?]*[ -/]*[@-~]', '' -replace '[\x00-\x08\x0B-\x1F\x7F]', ''
     if ($script:ScanLogWriter) {
@@ -42,6 +43,13 @@ function Invoke-LoggedOperation {
         [Parameter(Mandatory)][ValidateSet('Standard','Aggressive','Preview','Scan','Health','Benchmark')][string]$Mode,
         [Parameter(Mandatory)][scriptblock]$Action
     )
+    if ($Mode -eq 'Preview') {
+        $previous = $script:ReadOnlyOutput
+        $script:ReadOnlyOutput = $true
+        $script:ScanLogPath = $null
+        try { & $Action } finally { $script:ReadOnlyOutput = $previous }
+        return
+    }
     if ($script:ScanLogWriter) { & $Action; return }
     $directory = Get-ScanLogDirectory
     $null = [IO.Directory]::CreateDirectory($directory)
@@ -112,6 +120,7 @@ function Write-ScanReportLog {
     param([Parameter(Mandatory)][hashtable]$Report)
     Write-ScanLogText ''
     Write-ScanLogText 'FULL DISCOVERY REPORT'
+    Write-ScanLogText ("Status: {0} | Roots visited: {1} | Roots skipped: {2}" -f $Report.Status, ($Report.RootsVisited -join ', '), ($Report.RootsSkipped -join ', '))
     Write-ScanLogText ("Elapsed seconds: {0} | Candidates: {1}" -f $Report.DurationSec, @($Report.Findings).Count)
     Write-ScanLogText 'COVERAGE'
     foreach ($drive in $Report.Coverage) {
@@ -122,9 +131,10 @@ function Write-ScanReportLog {
     Write-ScanLogText 'CANDIDATES (data found, not space reclaimed)'
     foreach ($item in $Report.Findings) {
         Write-ScanLogText $item.Path
-        Write-ScanLogText ("  {0} | Bytes: {1} | Files: {2} | Age: {3} days | {4} | Eligible temp item: {5}" -f $item.Category, $item.Size, $item.FileCount, $item.DaysSinceModified, $item.Tier, $item.SafeDelete)
+        Write-ScanLogText ("  {0} | Bytes: {1} | Files: {2} | Age: {3} days | {4} | Eligible orphan: {5}" -f $item.Category, $item.Size, $item.FileCount, $item.DaysSinceModified, $item.Tier, $item.SafeDelete)
         Write-ScanLogText ("  Last modified UTC: {0} | Root: {1}" -f $item.LatestWriteUtc, $item.ScanRoot)
         Write-ScanLogText ("  Reason: {0}" -f $item.Reason)
+        Write-ScanLogText ("  Evidence rule: {0} | Checks: {1}" -f $item.EvidenceRule, ($item.EvidenceChecks -join '; '))
     }
     Write-ScanLogText 'ISSUES (all encountered errors and skips)'
     foreach ($issue in $Report.Issues) { Write-ScanLogText ("{0} | {1} | {2}" -f $issue.Kind, $issue.Path, $issue.Reason) }

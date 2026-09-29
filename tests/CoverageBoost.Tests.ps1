@@ -19,11 +19,8 @@ BeforeAll {
     # Keep legacy tests inside Pester's disposable sandbox. Script variables in this
     # test file do not set module state, so configure the actual module explicitly.
     Import-Module "$repoRoot/src/Bakunawa.Config.psm1" -Force -DisableNameChecking
-    Import-Module "$repoRoot/src/Bakunawa.Quarantine.psm1" -Force -DisableNameChecking
     & (Get-Module Bakunawa.Cleanup) { $script:IsPreview = $true }
     Mock -ModuleName Bakunawa.Cleanup Get-ScanDriveRoots { @($TestDrive) }
-    Mock -ModuleName Bakunawa.Cleanup Get-QuarantineRoot { Join-Path $TestDrive 'Quarantine' }
-    Mock -ModuleName Bakunawa.Quarantine Get-QuarantineRoot { Join-Path $TestDrive 'Quarantine' }
     Mock -ModuleName Bakunawa.Cleanup Get-DirectorySize {
         param($Path)
         # Real sizing for fixture paths; no machine-wide measurements in unit tests.
@@ -37,7 +34,7 @@ BeforeAll {
     $script:ExpectedSourceFiles = @(
         'apps.json','browsers.json','cloud.json','creative.json','devops.json',
         'devtools.json','devtools-extended.json','games.json','messaging.json',
-        'productivity.json','system.json'
+        'productivity.json','system.json','browser-automation.json'
     )
 }
 

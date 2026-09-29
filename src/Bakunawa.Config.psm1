@@ -169,11 +169,9 @@ function Get-DefaultConfig {
         scanSettings = @{
             roots = @()
             minAgeDays = 30
+            aggressiveMinAgeDays = 14
         }
         behaviorSettings = @{
-            quarantineBeforeDelete = $true
-            maxQuarantineSize = 10737418240
-            deleteQuarantineAfterDays = 30
             verboseLogging = $false
             trackDeletionHistory = $true
         }
@@ -235,6 +233,10 @@ function Test-ConfigSchema {
         }
         if ($null -ne $Config.scanSettings.roots -and $Config.scanSettings.roots -isnot [array]) {
             $errors += 'scanSettings.roots must be an array'
+        }
+        if ($null -ne $Config.scanSettings.aggressiveMinAgeDays -and
+            (-not [int]::TryParse([string]$Config.scanSettings.aggressiveMinAgeDays, [ref]$age) -or $age -lt 1 -or $age -gt 3650)) {
+            $errors += 'scanSettings.aggressiveMinAgeDays must be between 1 and 3650'
         }
     }
     if ($Config.riskTiers) {
