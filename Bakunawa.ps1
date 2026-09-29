@@ -48,6 +48,50 @@ function Test-IsAdministrator {
     $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
 }
 
+function Test-LegacyConsole {
+    # The host process that owns our console is the PARENT of this PowerShell
+    # process, not this process itself (we are always powershell.exe/pwsh.exe).
+    $self = Get-CimInstance Win32_Process -Filter "ProcessId=$PID" -ErrorAction SilentlyContinue
+    if (-not $self -or -not $self.ParentProcessId) { return $false }
+    $parent = Get-CimInstance Win32_Process -Filter "ProcessId=$($self.ParentProcessId)" -ErrorAction SilentlyContinue
+    if (-not $parent) { return $false }
+    return ($parent.Name -eq 'conhost.exe')
+}
+
+function Restart-ModernTerminal {
+    param([string]$SelectedMode)
+    $wt = Get-Command wt.exe -ErrorAction SilentlyContinue
+    if (-not $wt) {
+        Write-Host 'Windows Terminal (wt.exe) not found. Falling back to standard elevation.' -ForegroundColor Yellow
+        return (Restart-Elevated -SelectedMode $SelectedMode)
+    }
+    $entry = if ($PSCommandPath) { $PSCommandPath } else { Join-Path $PSScriptRoot 'Bakunawa.ps1' }
+    # ForceAdmin breaks the relaunch loop: the child is already elevated by -Verb RunAs,
+    # so it must not try to detect the console or elevate again.
+    $forward = @{ Mode = $SelectedMode; ForceAdmin = $true }
+    foreach ($name in @('NoAnimations','VerboseScan','NoPause')) {
+        if (Get-Variable -Name $name -ValueOnly) { $forward[$name] = $true }
+    }
+    foreach ($name in @('ExtraExcludePath','LogFile','ScanRoot','ReportPath','Profile')) {
+        $value = Get-Variable -Name $name -ValueOnly
+        if ($value) { $forward[$name] = $value }
+    }
+    $data = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes([Management.Automation.PSSerializer]::Serialize($forward)))
+    $body = '$forward = [Management.Automation.PSSerializer]::Deserialize([Text.Encoding]::UTF8.GetString([Convert]::FromBase64String(''{0}''))); & ''{1}'' @forward' -f $data, $entry.Replace("'", "''")
+    $encoded = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($body))
+    $cmd = "-NoProfile -ExecutionPolicy Bypass -EncodedCommand $encoded"
+    Write-Host ''
+    Write-Host 'Relaunching in Windows Terminal as Administrator...' -ForegroundColor Cyan
+    try {
+        Start-Process -FilePath $wt.Source -ArgumentList '-d', (Split-Path -Parent $entry), 'pwsh.exe', $cmd -Verb RunAs | Out-Null
+        return $true
+    } catch {
+        Write-Host "Windows Terminal launch failed: $($_.Exception.Message)" -ForegroundColor Red
+        Write-Host 'Falling back to standard elevation.' -ForegroundColor Yellow
+        return (Restart-Elevated -SelectedMode $SelectedMode)
+    }
+}
+
 function Restart-Elevated {
     param([string]$SelectedMode)
     $hostExe = $null
@@ -120,6 +164,11 @@ if (-not $SkipBootstrap) {
             Write-Host "Profile file not found: $profilePath" -ForegroundColor Red
             exit 1
         }
+    }
+
+    # Modern Terminal relaunch: detect legacy conhost and relaunch via wt.exe
+    if ((Test-LegacyConsole) -and -not $ForceAdmin) {
+        if (Restart-ModernTerminal -SelectedMode $Mode) { exit 0 }
     }
 
     # Admin check for modes that require it (Menu requires admin for cleanup actions)

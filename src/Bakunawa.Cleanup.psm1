@@ -223,6 +223,7 @@ function Get-TransientEntryMatches {
         if ($EntryType -eq 'file' -and $entry.PSIsContainer) { continue }
         $reason = $null
         if (Test-IsExcludedPath $entry.FullName) { $reason = 'protected' }
+        elseif (-not $entry.PSIsContainer -and (Test-ProtectedFileExtension $entry.Name)) { $reason = 'protected' }
         elseif ($cutoff -and $entry.LastWriteTime -ge $cutoff) { $reason = 'not stale' }
         elseif ($script:BusyCachePaths) {
             foreach ($busy in $script:BusyCachePaths) {
@@ -344,6 +345,7 @@ function Get-CleanupTasks {
     $null = $tasks.Add([PSCustomObject]@{ Name = 'Browser Caches'; Parallel = $true })
     $null = $tasks.Add([PSCustomObject]@{ Name = 'App Caches'; Parallel = $true })
     $null = $tasks.Add([PSCustomObject]@{ Name = 'Dev Caches'; Parallel = $true })
+    $null = $tasks.Add([PSCustomObject]@{ Name = 'AI Agent Caches'; Parallel = $false })
     $null = $tasks.Add([PSCustomObject]@{ Name = 'Game Caches'; Parallel = $false })
     $null = $tasks.Add([PSCustomObject]@{ Name = 'Browser Automation Caches'; Parallel = $false })
     $null = $tasks.Add([PSCustomObject]@{ Name = 'Package Manager Caches'; Parallel = $false })
@@ -420,6 +422,16 @@ function Get-CleanupPotential {
                             $bytes += Get-DirectorySize $resolved
                             $count++
                         }
+                    }
+                }
+            }
+            'AI Agent Caches' {
+                foreach ($app in @(Get-AllAppDefinitions -Category 'AI Agent Caches')) {
+                    if (-not $app.Path) { continue }
+                    foreach ($d in @(Expand-WildcardPath -Path $app.Path -DirectoriesOnly)) {
+                        if (-not $d -or -not (Test-Path -LiteralPath $d -PathType Container)) { continue }
+                        $bytes += Get-DirectorySize $d
+                        $count++
                     }
                 }
             }
@@ -1186,6 +1198,7 @@ function Invoke-CleanupRun {
             }
              'App Caches' { $null = Clear-AppCaches }
              'Dev Caches' { $null = Clear-DevCaches }
+             'AI Agent Caches' { $null = Clear-AIAgentCaches }
              'Game Caches' { $null = Clear-GameCaches }
              'Browser Automation Caches' { $null = Clear-BrowserAutomationCaches }
              'Package Manager Caches' { $null = Clear-PackageManagerCaches }
@@ -1497,6 +1510,50 @@ function Clear-PackageManagerCaches {
     return $n
 }
 
+# --- AI Agent Safety Guardrails ---
+# Protected extensions: never delete these in AI/dev directories
+$script:ProtectedExtensions = @('.json', '.yaml', '.yml', '.env', '.toml', '.ini', '.cfg', '.conf', '.config')
+
+# Targeted file patterns: only delete these in AI/dev directories
+$script:TargetedPatterns = @('*.tmp', '*.log', '*.bak', '*.cache', '*.blob', '*.sqlite-shm', '*.sqlite-wal')
+
+function Test-ProtectedFileExtension {
+    param([string]$FileName)
+    $ext = [IO.Path]::GetExtension($FileName).ToLower()
+    return $script:ProtectedExtensions -contains $ext
+}
+
+function Test-TargetedFilePattern {
+    param([string]$FileName)
+    foreach ($pattern in $script:TargetedPatterns) {
+        if ($FileName -like $pattern) { return $true }
+    }
+    return $false
+}
+
+function Clear-AIAgentCaches {
+    [CmdletBinding()]
+    param()
+    Write-CommandLog 'SCAN' 'AI Agent Caches'
+    $cat = 'AI Agent Caches'; $n = 0
+    $minAgeDays = 3
+
+    # Get-AllAppDefinitions already resolves env+path to a full path.
+    foreach ($app in @(Get-AllAppDefinitions -Category 'AI Agent Caches')) {
+        if (-not $app.Path) { continue }
+        foreach ($resolvedPath in @(Expand-WildcardPath -Path $app.Path -DirectoriesOnly)) {
+            if (-not $resolvedPath) { continue }
+            if (-not (Test-Path -LiteralPath $resolvedPath -PathType Container)) { continue }
+            # Get-TransientEntryMatches enforces the exclusion list, IsAllowedPath,
+            # the age cutoff and busy-cache checks; Clear-TransientEntries deletes
+            # via Remove-ItemSafely, which honours $script:IsPreview.
+            $n += Clear-TransientEntries -Directory $resolvedPath -Patterns $script:TargetedPatterns `
+                -EntryType 'file' -MinAgeDays $minAgeDays -Category $cat
+        }
+    }
+    return $n
+}
+
 Export-ModuleMember -Function @(
     'Measure-AndClear',
     'Get-CleanupTasks',
@@ -1526,6 +1583,9 @@ Export-ModuleMember -Function @(
     'Initialize-CleanupState',
     'Clear-CachedOrphans',
     'Clear-Prefetch',
+    'Clear-AIAgentCaches',
+    'Test-ProtectedFileExtension',
+    'Test-TargetedFilePattern',
     'Clear-EventLogs',
     'Clear-FontCache',
     'Get-CleanupErrorLog',

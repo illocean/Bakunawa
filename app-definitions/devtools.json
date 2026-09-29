@@ -372,5 +372,35 @@
       { "env": "APPDATA", "path": "Insomnia/GPUCache" },
       { "env": "APPDATA", "path": "Insomnia/logs" }
     ]
+  },
+  {
+    "name": "9Router",
+    "process": "9router",
+    "category": "AI Agent Caches",
+    "locations": [
+      { "env": "APPDATA", "path": "9router/logs" },
+      { "env": "APPDATA", "path": "9router/headroom" },
+      { "env": "APPDATA", "path": "9router/db/backups" }
+    ]
+  },
+  {
+    "name": "OmniRoute",
+    "process": "omniroute",
+    "category": "AI Agent Caches",
+    "locations": [
+      { "env": "USERPROFILE", "path": ".omniroute/call_logs" },
+      { "env": "USERPROFILE", "path": ".omniroute/logs" },
+      { "env": "USERPROFILE", "path": ".omniroute/db_backups" }
+    ]
+  },
+  {
+    "name": "MiMo Code",
+    "process": "mimo",
+    "category": "AI Agent Caches",
+    "locations": [
+      { "env": "LOCALAPPDATA", "path": "MiMo Code/Cache" },
+      { "env": "LOCALAPPDATA", "path": "MiMo Code/logs" },
+      { "env": "APPDATA", "path": "MiMo Code/logs" }
+    ]
   }
 ]

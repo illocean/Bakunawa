@@ -135,6 +135,7 @@ function Get-DefaultConfig {
             "Browser Caches" = @{ enabled = $true; riskTier = "Safe"; description = "Chrome, Edge, Firefox cache and cookies" }
             "App Caches" = @{ enabled = $true; riskTier = "Safe"; description = "Application-specific cache directories" }
             "Dev Caches" = @{ enabled = $true; riskTier = "Safe"; description = "Development tool caches (git, node, etc)" }
+            "AI Agent Caches" = @{ enabled = $true; riskTier = "Safe"; description = "AI agent and local proxy caches (OpenCode, OmniRoute, 9Router, MiMo Code)" }
             "Game Caches" = @{ enabled = $true; riskTier = "Safe"; description = "Game platform caches (Roblox, Steam, Epic, Battle.net)" }
             "Browser Automation Caches" = @{ enabled = $true; riskTier = "Moderate"; description = "Playwright, Puppeteer, Selenium downloaded browsers" }
             "Package Manager Caches" = @{ enabled = $true; riskTier = "Safe"; description = "npm, pip, Hugging Face ML model caches" }
