@@ -35,9 +35,9 @@ Describe 'Command-line mode routing' {
     }
 
     It 'runs the <RunMode> entry point through automatic logging' -TestCases @(
-        @{ RunMode = 'Standard'; Expected = 'CLEANUP SUMMARY' },
-        @{ RunMode = 'Aggressive'; Expected = 'CLEANUP SUMMARY' },
-        @{ RunMode = 'Scan'; Expected = 'SCAN SUMMARY' },
+        @{ RunMode = 'Standard'; Expected = 'Cleanup complete' },
+        @{ RunMode = 'Aggressive'; Expected = 'Cleanup complete' },
+        @{ RunMode = 'Scan'; Expected = 'Scan complete' },
         @{ RunMode = 'Health'; Expected = 'Fixture health summary' },
         @{ RunMode = 'Benchmark'; Expected = 'BENCHMARK SUMMARY' }
     ) {
@@ -127,7 +127,7 @@ Describe 'Automatic text reports and terminal layout' {
         $path = Get-ScanLogPath
         [IO.Path]::GetExtension($path) | Should -Be '.txt'
         $log = Get-Content -LiteralPath $path -Raw -Encoding UTF8
-        $log | Should -Match ("BAKUNAWA / {0}" -f $RunMode.ToUpperInvariant())
+        $log | Should -Match ("{0} · started" -f $RunMode)
         $log | Should -Match 'Fixture report: 4096 bytes'
         $log | Should -Match 'RUN FINISHED.*Finished; see summary'
         $log | Should -Not -Match '\x1B'
@@ -224,10 +224,10 @@ Describe 'Automatic text reports and terminal layout' {
             Write-ScanReportLog -Report $report
             Show-OrphanScanResults -ScanResult $report
         } 6>&1 | Out-String
-        $output.IndexOf('SCAN SUMMARY') | Should -BeLessThan $output.IndexOf('[1]')
+        $output.IndexOf('Scan complete') | Should -BeLessThan $output.IndexOf('candidate-1.tmp')
         $output | Should -Match 'Finished with coverage gaps'
         $output | Should -Match 'Local disk C: only'
-        $output | Should -Match 'DATA BY CATEGORY / largest first'
+        $output | Should -Match '14 items'
         $output | Should -Match 'Showing the largest 10 of 14'
         $output | Should -Match 'locked-7'
         $output | Should -Not -Match 'candidate-14.tmp'
@@ -244,12 +244,12 @@ Describe 'Automatic text reports and terminal layout' {
             PathsCleared = 1; BytesFreed = 4096; Errors = @();
             SkippedItems = @(); CategorySizes = @{ Cache = 4096 }; ScanReport = $null }
         $preview = Show-CleanupResult $result 6>&1 | Out-String
-        $preview | Should -Match 'Estimated eligible data'
-        $preview | Should -Match 'No files were deleted'
-        $preview | Should -Not -Match 'Deleted data\s*:'
+        $preview | Should -Match 'reclaimable'
+        $preview | Should -Match 'nothing was deleted'
+        $preview | Should -Not -Match 'deleted on disk'
         $result.Mode = 'Standard'; $result.IsPreview = $false
         $cleanup = Show-CleanupResult $result 6>&1 | Out-String
-        $cleanup | Should -Match 'Deleted data\s*: 4 KB'
+        $cleanup | Should -Match 'Deleted\s+4 KB on disk'
         $cleanup | Should -Not -Match 'Quarantined data'
         $cleanup | Should -Match 'Deletion is permanent'
     }

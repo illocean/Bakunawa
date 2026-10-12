@@ -198,6 +198,9 @@ $script:UiProgressLength = 0
 function Write-UiProgress {
     [CmdletBinding()]
     param([string]$Text)
+    # A redirected run has no cursor to move, so a transient line is just noise
+    # in the captured output and in the log.
+    if ([Console]::IsOutputRedirected) { return }
     $text = "[$Text]"
     Write-Host $text -ForegroundColor 'DarkCyan' -NoNewline
     $script:UiProgressLength = $text.Length
@@ -236,22 +239,6 @@ function Write-CenteredLine {
     $rt = Get-DisplayText $Text $cw
     $pad = [Math]::Max(0,[int](($cw-$rt.Length)/2))
     Write-Host ((' '*$pad)+$rt) -ForegroundColor $ForegroundColor
-}
-
-function Write-SectionHeader {
-    [CmdletBinding()]
-    param([string]$Title,[string]$ForegroundColor='White')
-    $cw = Get-ConsoleWidth
-    $useVT = Test-VT100Supported
-    if ($useVT) {
-        $boxH = [char]0x2500
-        $line = $boxH.ToString() * [Math]::Max(0, $cw - 4)
-        Write-Host (([char]0x250C).ToString()+"- $Title $line") -ForegroundColor $ForegroundColor
-    } else {
-        $prefix = "-- $Title "
-        $line = $prefix + ('-' * [Math]::Max(0, $cw - $prefix.Length))
-        Write-Host (Get-DisplayText $line $cw) -ForegroundColor $ForegroundColor
-    }
 }
 
 function Write-Panel {
@@ -368,30 +355,9 @@ function Get-ThemedGlyph {
     }
 }
 
-function Get-MoonPhaseGlyph {
-    [CmdletBinding()]
-    param([int]$Percent)
-    if (Test-VT100Supported) {
-        # Monochrome geometric circles (no emoji): new -> crescent -> half -> gibbous -> full
-        $moon = @(
-            [char]0x25CB,  # ○
-            [char]0x25D0,  # ◐
-            [char]0x25D2,  # ◒
-            [char]0x25D5,  # ◕
-            [char]0x25CF   # ●
-        )
-        $idx = [Math]::Min(4, [Math]::Max(0, [int]($Percent / 25)))
-        return $moon[$idx]
-    }
-    $ascii = @('o','O','@','*')
-    $idx = [Math]::Min(3, [Math]::Max(0, [int]($Percent / 34)))
-    return $ascii[$idx]
-}
-
 function Reset-CleanupProgress {
     $script:StepIndex = 0
     $script:TotalSteps = 0
-    $script:ActiveStepName = $null
 }
 
 function Set-UiContext {
@@ -413,7 +379,6 @@ function Start-Step {
     Write-Host ''
     $stepTag = if ($script:TotalSteps -gt 0) { '[{0:D2}/{1:D2}]' -f $script:StepIndex, $script:TotalSteps } else { '[--/--]' }
     Write-ReviewLine ("{0} {1}" -f $stepTag, $Name)
-    $script:ActiveStepName = $Name; $script:ActiveStepPct = 0
     $script:StepWatch = [Diagnostics.Stopwatch]::StartNew()
     if (-not $script:NoAnimations) {
         Write-Progress -Id 1 -Activity 'Bakunawa / categories' -Status "$stepTag $Name" -PercentComplete ([int](100 * ($script:StepIndex - 1) / $script:TotalSteps))
@@ -424,7 +389,6 @@ function Start-Step {
 function Finish-Step {
     [CmdletBinding()]
     param([string]$Summary)
-    $script:ActiveStepName = $null
     if ($Summary) {
         Write-ReviewLine ("  Done in {0} | {1}" -f (Format-ReportDuration $script:StepWatch.Elapsed.TotalSeconds), $Summary) -ForegroundColor Gray
     }
@@ -457,6 +421,16 @@ foreach (`$m in @('Core','Config','Cleanup','UI')) {
 try { Initialize-ConfigModule -ConfigPath `$cfgPath } catch { }
 try { Initialize-CleanupState -Config (Get-UserConfig -ConfigPath `$cfgPath) } catch { }
 `$items = @(Get-CleanupPotential -Mode 'Standard')
+# Count only categories a Standard run would clean: disabled tasks
+# (taskCategories.*.enabled = false) would inflate the menu's estimate.
+`$cfg = `$null
+try { `$cfg = Get-UserConfig -ConfigPath `$cfgPath } catch { }
+if (`$cfg -and `$cfg.taskCategories) {
+    `$items = @(`$items | Where-Object {
+        `$e = `$cfg.taskCategories[`$_.Task].enabled
+        `$null -eq `$e -or `$e
+    })
+}
 [PSCustomObject]@{
     Bytes = [long]((`$items | Measure-Object -Property EstimatedBytes -Sum).Sum)
     Tasks = @(`$items).Count
@@ -543,23 +517,6 @@ function Show-Header {
     if (-not $script:CurrentModeName) { $script:CurrentModeName = 'Menu' }
     Clear-Host; Write-Host ''; Show-AppLogo; Write-Host ''
     Show-StatusBand
-    Write-Host ''
-}
-
-function Show-CleanupPotential {
-    [CmdletBinding()]
-    param([ValidateSet('Standard','Aggressive','Preview')][string]$Mode = 'Standard')
-    $effectiveMode = if ($Mode -eq 'Preview') { 'Standard' } else { $Mode }
-    $potential = @(Get-CleanupPotential -Mode $effectiveMode)
-    if (-not $potential -or $potential.Count -eq 0) {
-        Write-Log 'No cleanup potential data available.' 'WARN'
-        return
-    }
-    Write-SectionHeader 'Cleanup Potential'
-    Write-Host ("  {0,-22} {1,12} {2,8}" -f 'Task', 'Size', 'Targets') -ForegroundColor Cyan
-    foreach ($item in $potential) {
-        Write-Host ("  {0,-22} {1,12} {2,8}" -f $item.Task, (Format-FileSize $item.EstimatedBytes), $item.FileCount) -ForegroundColor DarkGray
-    }
     Write-Host ''
 }
 
@@ -672,61 +629,6 @@ function Show-Menu {
     }
 }
 
-function Show-RunSummary {
-    [CmdletBinding()]
-    param(
-        [string]$Mode, [double]$Duration, $StartSpace, $EndSpace,
-        [hashtable]$Steps, [switch]$Aggressive, [int]$LogsCl
-    )
-    $summaryColor = Get-ModeColor $Mode
-    $labelWidth = 16
-    $ruleWidth = 60
-    Write-Host ''
-    Write-UiRule -Text ("$($Mode.ToUpper()) RUN") -Color $summaryColor -Width $ruleWidth
-    # Measured leads, observed follows. They disagree on purpose: one is what
-    # the scan saw, the other is what the drive actually gave back.
-    Write-UiField 'Deleted data' (Format-FileSize ([Math]::Max(0, $script:BytesFreed))) -ValueColor 'White' -LabelWidth $labelWidth
-    Write-UiField 'Freed on disk' ("{0} MB ({1} GB)" -f ($EndSpace.MB - $StartSpace.MB), [Math]::Round(($EndSpace.MB - $StartSpace.MB) / 1024, 2)) -ValueColor 'Gray' -LabelWidth $labelWidth
-    Write-UiField 'Duration' "${Duration}s" -ValueColor 'Gray' -LabelWidth $labelWidth
-    Write-UiField 'Finished' (Get-Date).ToString('yyyy-MM-dd HH:mm:ss') -ValueColor 'Gray' -LabelWidth $labelWidth
-    if ($script:CategorySizes.Count -gt 0) {
-        Write-Host ''
-        Write-UiRule -Text 'BY CATEGORY / largest first' -Color $summaryColor -Width $ruleWidth
-        $script:CategorySizes.GetEnumerator() | Sort-Object Value -Descending | ForEach-Object {
-            Write-UiField $_.Key (Format-FileSize $_.Value) -ValueColor 'Gray' -LabelWidth 24
-        }
-    }
-    Write-Host ''
-    Write-UiRule -Text 'WHAT WAS TOUCHED' -Color $summaryColor -Width $ruleWidth
-    # Every number in this block is a file count. Saying so once per row costs
-    # nothing and stops 1,204 being read as megabytes next to the sizes above.
-    $impact = @(
-        @('System caches', "$(if ($null -ne $Steps.s1) { [int]$Steps.s1 } else { 0 }) files"),
-        @('Browsers', "$($Steps.s2) Chromium | $($Steps.s3) Firefox"),
-        @('App caches', "$(if ($null -ne $Steps.s4) { [int]$Steps.s4 } else { 0 }) files"),
-        @('Dev caches', "$(if ($null -ne $Steps.s5) { [int]$Steps.s5 } else { 0 }) files"),
-        @('GPU/Shell', "$(if ($null -ne $Steps.s6) { [int]$Steps.s6 } else { 0 }) files"),
-        @('Log files', "$(if ($null -ne $Steps.s8) { [int]$Steps.s8 } else { 0 }) files"),
-        @('Empty folders', "$(if ($null -ne $Steps.emptyRm) { [int]$Steps.emptyRm } else { 0 }) folders"),
-        @('Stale junk', "$(if ($null -ne $Steps.staleRm) { [int]$Steps.staleRm } else { 0 }) items"),
-        @('Orphans', "$(if ($null -ne $Steps.orphans) { [int]$Steps.orphans } else { 0 }) folders")
-    )
-    foreach ($row in $impact) {
-        $color = if ($row[0] -eq 'Orphans' -and $row[1] -gt 0) { 'Yellow' } else { 'Gray' }
-        Write-UiField $row[0] $row[1] -ValueColor $color -LabelWidth $labelWidth
-    }
-    if ($script:SkippedItems.Count -gt 0) {
-        Write-Host ''
-        Write-UiRule -Text 'SAFETY SKIPS' -Color 'Yellow' -Width $ruleWidth
-        $script:SkippedItems | Group-Object Reason | Sort-Object Count -Descending | ForEach-Object {
-            Write-UiField ("{0}x" -f $_.Count) $_.Name -ValueColor 'Gray' -LabelWidth $labelWidth
-        }
-    }
-    Write-Host ''
-    if ($script:IsPreview) { Write-Log 'PREVIEW mode. Nothing was deleted.' 'WARN' }
-    elseif ($script:IsAggressive) { Write-Log 'Aggressive mode completed with extras.' 'WARN' }
-}
-
 . (Join-Path $PSScriptRoot 'Bakunawa.Reporting.ps1')
 . (Join-Path $PSScriptRoot 'Bakunawa.Review.ps1')
 
@@ -777,14 +679,18 @@ Export-ModuleMember -Function @(
     'Write-ScanLogText',
     'Write-ScanReportLog',
     'Write-ScanProgress',
-    'Write-ReportHeading',
-    'Write-ReportMetric',
+    'Format-Count',
+    'Write-ReportRow',
+    'Write-ReportTitle',
+    # Discovery.ps1 runs inside the Cleanup module, so the transient status pair
+    # has to be exported for a scan to report progress at all.
+    'Write-UiProgress',
+    'Clear-UiProgress',
     'Format-ReportDuration',
     'Initialize-UiLogging',
     'Write-Log',
     'Write-CommandLog',
     'Write-CenteredLine',
-    'Write-SectionHeader',
     'Write-Panel',
     'Write-ConfirmFrame',
     'Get-UiLayout',
@@ -793,15 +699,12 @@ Export-ModuleMember -Function @(
     'Update-ReclaimableTotal',
     'Show-AppLogo',
     'Get-ThemedGlyph',
-    'Get-MoonPhaseGlyph',
     'Start-Step',
     'Reset-CleanupProgress',
     'Set-UiContext',
     'Finish-Step',
     'Show-Header',
-    'Show-CleanupPotential',
     'Show-Menu',
-    'Show-RunSummary',
     'Export-ScanReport',
     'Show-OrphanScanResults',
     'Show-CleanupResult',

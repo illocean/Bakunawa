@@ -341,29 +341,36 @@ function Get-CleanupTasks {
     [CmdletBinding()]
     param([ValidateSet('Standard','Aggressive')][string]$Mode = 'Standard')
     $tasks = [System.Collections.Generic.List[System.Object]]::new()
-    $null = $tasks.Add([PSCustomObject]@{ Name = 'System Caches'; Parallel = $false })
-    $null = $tasks.Add([PSCustomObject]@{ Name = 'Browser Caches'; Parallel = $true })
-    $null = $tasks.Add([PSCustomObject]@{ Name = 'App Caches'; Parallel = $true })
-    $null = $tasks.Add([PSCustomObject]@{ Name = 'Dev Caches'; Parallel = $true })
-    $null = $tasks.Add([PSCustomObject]@{ Name = 'AI Agent Caches'; Parallel = $false })
-    $null = $tasks.Add([PSCustomObject]@{ Name = 'Game Caches'; Parallel = $false })
-    $null = $tasks.Add([PSCustomObject]@{ Name = 'Browser Automation Caches'; Parallel = $false })
-    $null = $tasks.Add([PSCustomObject]@{ Name = 'Package Manager Caches'; Parallel = $false })
-    $null = $tasks.Add([PSCustomObject]@{ Name = 'Cloud Sync'; Parallel = $false })
-    $null = $tasks.Add([PSCustomObject]@{ Name = 'Creative Apps'; Parallel = $false })
-    $null = $tasks.Add([PSCustomObject]@{ Name = 'Productivity'; Parallel = $false })
-    $null = $tasks.Add([PSCustomObject]@{ Name = 'DevOps Tools'; Parallel = $false })
-    $null = $tasks.Add([PSCustomObject]@{ Name = 'GPU/Shell Caches'; Parallel = $false })
-    $null = $tasks.Add([PSCustomObject]@{ Name = 'Recycle Bin'; Parallel = $false })
-    $null = $tasks.Add([PSCustomObject]@{ Name = 'Thumbnail Cache'; Parallel = $false })
-    $null = $tasks.Add([PSCustomObject]@{ Name = 'Log Files'; Parallel = $false })
-    $null = $tasks.Add([PSCustomObject]@{ Name = 'Empty/Stale Folders'; Parallel = $false })
-    $null = $tasks.Add([PSCustomObject]@{ Name = 'Orphan Scan'; Parallel = $false })
-    $null = $tasks.Add([PSCustomObject]@{ Name = 'User Hidden Folders'; Parallel = $false })
-    $null = $tasks.Add([PSCustomObject]@{ Name = 'Scoop Cache'; Parallel = $false })
-    $null = $tasks.Add([PSCustomObject]@{ Name = 'Rust Cargo Cache'; Parallel = $false })
-    $null = $tasks.Add([PSCustomObject]@{ Name = 'Go Module Cache'; Parallel = $false })
-    $null = $tasks.Add([PSCustomObject]@{ Name = 'Bun Cache'; Parallel = $false })
+    $null = $tasks.Add([PSCustomObject]@{ Name = 'System Caches' })
+    $null = $tasks.Add([PSCustomObject]@{ Name = 'Browser Caches' })
+    $null = $tasks.Add([PSCustomObject]@{ Name = 'App Caches' })
+    $null = $tasks.Add([PSCustomObject]@{ Name = 'Dev Caches' })
+    $null = $tasks.Add([PSCustomObject]@{ Name = 'AI Agent Caches' })
+    $null = $tasks.Add([PSCustomObject]@{ Name = 'Game Caches' })
+    $null = $tasks.Add([PSCustomObject]@{ Name = 'Browser Automation Caches' })
+    $null = $tasks.Add([PSCustomObject]@{ Name = 'Package Manager Caches' })
+    $null = $tasks.Add([PSCustomObject]@{ Name = 'Cloud Sync' })
+    $null = $tasks.Add([PSCustomObject]@{ Name = 'Creative Apps' })
+    $null = $tasks.Add([PSCustomObject]@{ Name = 'Productivity' })
+    $null = $tasks.Add([PSCustomObject]@{ Name = 'DevOps Tools' })
+    $null = $tasks.Add([PSCustomObject]@{ Name = 'GPU/Shell Caches' })
+    $null = $tasks.Add([PSCustomObject]@{ Name = 'Recycle Bin' })
+    $null = $tasks.Add([PSCustomObject]@{ Name = 'Thumbnail Cache' })
+    $null = $tasks.Add([PSCustomObject]@{ Name = 'Log Files' })
+    $null = $tasks.Add([PSCustomObject]@{ Name = 'Empty/Stale Folders' })
+    $null = $tasks.Add([PSCustomObject]@{ Name = 'Orphan Scan' })
+    $null = $tasks.Add([PSCustomObject]@{ Name = 'User Hidden Folders' })
+    $null = $tasks.Add([PSCustomObject]@{ Name = 'Scoop Cache' })
+    $null = $tasks.Add([PSCustomObject]@{ Name = 'Rust Cargo Cache' })
+    $null = $tasks.Add([PSCustomObject]@{ Name = 'Go Module Cache' })
+    $null = $tasks.Add([PSCustomObject]@{ Name = 'Bun Cache' })
+    if ($Mode -eq 'Aggressive') {
+        # Aggressive-only Windows maintenance. The dispatch arms already existed in
+        # Invoke-CleanupRun and Get-CleanupPotential; these names light them up.
+        $null = $tasks.Add([PSCustomObject]@{ Name = 'Prefetch' })
+        $null = $tasks.Add([PSCustomObject]@{ Name = 'DISM' })
+        $null = $tasks.Add([PSCustomObject]@{ Name = 'Event Logs + Font Cache' })
+    }
     return @($tasks)
 }
 
@@ -426,12 +433,18 @@ function Get-CleanupPotential {
                 }
             }
             'AI Agent Caches' {
+                # Cleanup only removes targeted temp patterns older than the guardrail,
+                # so measuring whole directories over-reported this category badly.
                 foreach ($app in @(Get-AllAppDefinitions -Category 'AI Agent Caches')) {
                     if (-not $app.Path) { continue }
+                    $ageDays = if ($app.MinAgeDays -gt 0) { $app.MinAgeDays } else { 3 }
                     foreach ($d in @(Expand-WildcardPath -Path $app.Path -DirectoriesOnly)) {
                         if (-not $d -or -not (Test-Path -LiteralPath $d -PathType Container)) { continue }
-                        $bytes += Get-DirectorySize $d
-                        $count++
+                        foreach ($match in @(Get-TransientEntryMatches -Directory $d -Patterns $script:TargetedPatterns -EntryType 'file' -MinAgeDays $ageDays)) {
+                            if ($match.Reason -or $null -eq $match.Bytes) { continue }
+                            $bytes += [long]$match.Bytes
+                            $count++
+                        }
                     }
                 }
             }
@@ -482,7 +495,10 @@ function Get-CleanupPotential {
                 }
             }
             'User Hidden Folders' {
-                foreach ($h in @((Join-EnvPath 'USERPROFILE' '.local'), (Join-EnvPath 'USERPROFILE' '.cache'), (Join-EnvPath 'LOCALAPPDATA' '.cache'))) {
+                # Mirror the cleanup arm's actual targets.
+                foreach ($h in @((Join-EnvPath 'USERPROFILE' '.cache'),
+                                 (Join-EnvPath 'USERPROFILE' '.config' 'cache'),
+                                 (Join-EnvPath 'LOCALAPPDATA' 'VirtualStore'))) {
                     if ($h -and (Test-Path -LiteralPath $h -PathType Container)) {
                         $bytes += Get-DirectorySize $h
                         $count++
@@ -490,33 +506,27 @@ function Get-CleanupPotential {
                 }
             }
             'Scoop Cache' {
+                # Mirror the cleanup arm: only scoop\cache is cleared; scoop\apps
+                # holds installed applications and is never reclaimed.
                 $scoopDir = (Join-EnvPath 'USERPROFILE' 'scoop' 'cache')
                 if ($scoopDir -and (Test-Path -LiteralPath $scoopDir -PathType Container)) {
                     $bytes += Get-DirectorySize $scoopDir
                     $count++
                 }
-                $scoopApps = (Join-EnvPath 'USERPROFILE' 'scoop' 'apps')
-                if ($scoopApps -and (Test-Path -LiteralPath $scoopApps -PathType Container)) {
-                    $bytes += Get-DirectorySize $scoopApps
-                    $count++
-                }
             }
             'Rust Cargo Cache' {
-                $cargoDir = (Join-EnvPath 'USERPROFILE' '.cargo')
+                # Mirror the cleanup arm: only .cargo\registry\cache is cleared.
+                $cargoDir = (Join-EnvPath 'USERPROFILE' '.cargo' 'registry' 'cache')
                 if ($cargoDir -and (Test-Path -LiteralPath $cargoDir -PathType Container)) {
                     $bytes += Get-DirectorySize $cargoDir
                     $count++
                 }
             }
             'Go Module Cache' {
-                $goDir = (Join-EnvPath 'USERPROFILE' 'go' 'pkg' 'mod')
+                # Mirror the cleanup arm: only go\pkg\mod\cache is cleared.
+                $goDir = (Join-EnvPath 'USERPROFILE' 'go' 'pkg' 'mod' 'cache')
                 if ($goDir -and (Test-Path -LiteralPath $goDir -PathType Container)) {
                     $bytes += Get-DirectorySize $goDir
-                    $count++
-                }
-                $goSumDir = (Join-EnvPath 'USERPROFILE' 'go' 'pkg' 'sumdb')
-                if ($goSumDir -and (Test-Path -LiteralPath $goSumDir -PathType Container)) {
-                    $bytes += Get-DirectorySize $goSumDir
                     $count++
                 }
             }
@@ -543,8 +553,10 @@ function Get-CleanupPotential {
             'Package Manager Caches' {
                 foreach ($pmc in @(
                     (Join-EnvPath 'APPDATA' 'npm-cache'),
+                    # %LOCALAPPDATA%\pip\Cache is the same directory as the old
+                    # %USERPROFILE%\AppData\Local\pip\Cache entry; listing both
+                    # double-counted the estimate.
                     (Join-EnvPath 'LOCALAPPDATA' 'pip\Cache'),
-                    (Join-EnvPath 'USERPROFILE' 'AppData\Local\pip\Cache'),
                     (Join-EnvPath 'USERPROFILE' '.cache\huggingface'),
                     (Join-EnvPath 'LOCALAPPDATA' 'huggingface\cache')
                 )) {
@@ -553,6 +565,25 @@ function Get-CleanupPotential {
                         $count++
                     }
                 }
+            }
+            'Prefetch' {
+                $pf = $script:SysLoc.Prefetch
+                if ($pf -and (Test-Path -LiteralPath $pf -PathType Container)) {
+                    $bytes = Get-DirectorySize $pf
+                    $count = 1
+                }
+            }
+            'Event Logs + Font Cache' {
+                # Event logs are retained; only the font cache is reclaimable here.
+                $fc = Join-EnvPath 'LOCALAPPDATA' 'Microsoft' 'Windows' 'FontCache'
+                if ($fc -and (Test-Path -LiteralPath $fc -PathType Container)) {
+                    $bytes = Get-DirectorySize $fc
+                    $count = 1
+                }
+            }
+            'DISM' {
+                # Component-store savings depend on servicing history and are not
+                # predictable; reported as no estimate rather than a guess.
             }
             'GPU/Shell Caches' {
                 foreach ($g in @((Join-EnvPath 'LOCALAPPDATA' 'Microsoft' 'Windows' 'DXCache'))) {
@@ -748,20 +779,20 @@ function Clear-SystemCaches {
         Select-Object -Unique
     foreach ($t in $targets) { if ($t -and (Measure-AndClear $t -EnsureDirectory -Category $cat)) { $n++ } }
     if (-not [Bakunawa.Scanner]::IsAllowedPath($script:SysLoc.WindowsRoot)) { return $n }
-    $restart = @()
-    try {
-        foreach ($svc in 'wuauserv','bits','dosvc') {
-            $s = Get-Service $svc -EA SilentlyContinue
-            if ($s -and $s.Status -ne 'Stopped') {
-                Write-CommandLog ($(if($script:IsPreview){'PREVIEW stop'}else{'STOP'})) $svc
-                if (-not $script:IsPreview) { Stop-Service $svc -Force -EA SilentlyContinue; $restart += $svc }
-            }
+    # The task loop is the planning pass ($script:IsPreview is always true), so the
+    # old stop/restart block here never ran: SoftwareDistribution candidates were
+    # deleted later, mid-write, and the finally clause restarted nothing. Record the
+    # services instead; the execution phase stops them before mutating and restarts
+    # them afterwards.
+    foreach ($svc in 'wuauserv','bits','dosvc') {
+        $s = Get-Service $svc -EA SilentlyContinue
+        if ($s -and $s.Status -ne 'Stopped') {
+            if ($null -eq $script:PendingServices) { $script:PendingServices = @() }
+            $script:PendingServices += $svc
         }
-        if ($script:SysLoc.SoftDistDL -and (Measure-AndClear $script:SysLoc.SoftDistDL -EnsureDirectory -Category $cat)) { $n++ }
-        if ($script:SysLoc.DeliveryOpt -and (Measure-AndClear $script:SysLoc.DeliveryOpt -EnsureDirectory -Category $cat)) { $n++ }
-    } finally {
-        foreach ($svc in $restart) { Write-CommandLog 'START' $svc; Start-Service $svc -EA SilentlyContinue }
     }
+    if ($script:SysLoc.SoftDistDL -and (Measure-AndClear $script:SysLoc.SoftDistDL -EnsureDirectory -Category $cat)) { $n++ }
+    if ($script:SysLoc.DeliveryOpt -and (Measure-AndClear $script:SysLoc.DeliveryOpt -EnsureDirectory -Category $cat)) { $n++ }
     $n
 }
 
@@ -818,19 +849,6 @@ function Clear-ChromiumCaches {
     return $n
 }
 
-function Clear-FirefoxCaches {
-    [CmdletBinding()]
-    param([AllowEmptyString()][string]$ProfileRoot)
-    $cat = 'Browser Caches'; $n = 0
-    if (-not (Test-Path -LiteralPath $ProfileRoot -PathType Container)) { return 0 }
-    $cacheDirs = @('cache2','thumbnails','startupCache','shader-cache')
-    foreach ($d in $cacheDirs) {
-        $p = Join-Path $ProfileRoot $d
-        if ($p -and (Measure-AndClear $p -EnsureDirectory -Category $cat)) { $n++ }
-    }
-    return $n
-}
-
 function Clear-AppCaches {
     [CmdletBinding()]
     param()
@@ -879,7 +897,6 @@ function Clear-DevCaches {
         (Join-EnvPath 'LOCALAPPDATA' 'pip' 'Cache'),
         (Join-EnvPath 'LOCALAPPDATA' 'NuGet' 'v3' 'http-cache'),
         (Join-EnvPath 'LOCALAPPDATA' 'Yarn' 'Cache'),
-        (Join-EnvPath 'LOCALAPPDATA' 'LOCALAPPDATA' 'pip' 'Cache'),
         (Join-EnvPath 'LOCALAPPDATA' 'dotnet' 'NuGet' 'v2' 'http-cache'),
         (Join-EnvPath 'APPDATA' 'Code' 'Cache'),
         $(if ($tempRoot) { Join-Path $tempRoot 'npm-*' }),
@@ -959,14 +976,13 @@ function Clear-RecycleBinSafe {
         return $true
     }
     try {
-        $recycleBin = 0
         if (-not $script:IsPreview) {
             Clear-RecycleBin -DriveLetter C -Force -ErrorAction Stop
         }
-          Write-CommandLog "CLEAR $(if($script:IsPreview){'PREVIEW'}else{''})" 'Recycle Bin on C:'
-          return $true
-      } catch {
-          Register-CleanupError -Path 'Recycle Bin' -Category 'Recycle Bin' -Message $_.Exception.Message
+        Write-CommandLog "CLEAR $(if($script:IsPreview){'PREVIEW'}else{''})" 'Recycle Bin on C:'
+        return $true
+    } catch {
+        Register-CleanupError -Path 'Recycle Bin' -Category 'Recycle Bin' -Message $_.Exception.Message
           return $false
       }
 }
@@ -1123,12 +1139,17 @@ function Invoke-CleanupRun {
     $script:BytesFreed = 0L
     $script:CategorySizes = @{}
     $script:Errors = @()
-    $script:SkippedItems = @()
     $preview = ($WhatIf.IsPresent -or ($Mode -eq 'Preview'))
     $script:IsPreview = $true
     $script:Planning = $true
     $script:ActiveCategory = 'Discovery'
     $script:CandidateRecords = [Collections.Generic.List[object]]::new()
+    # Commands that cannot run during the planning pass (where IsPreview is always
+    # true) are queued here and executed after candidate processing in real runs.
+    $script:PendingActions = @()
+    # Services that guard queued cleanup targets (wuauserv/bits/dosvc hold
+    # SoftwareDistribution files); stopped and restarted by the execution phase.
+    $script:PendingServices = @()
     try {
     $effectiveMode = if ($Mode -eq 'Preview') { 'Standard' } else { $Mode }
     
@@ -1143,7 +1164,7 @@ function Invoke-CleanupRun {
         }
     }
 
-    Initialize-CleanupState -Config $Config -Aggressive:($effectiveMode -eq 'Aggressive')
+    Initialize-CleanupState -Config $Config -Aggressive:($effectiveMode -eq 'Aggressive') -ModeName $effectiveMode
     $Config = $script:CleanupConfig
     $preview = ($preview -or [bool]$Config.cleanupMode.dryRun)
 
@@ -1159,8 +1180,6 @@ function Invoke-CleanupRun {
         })
     }
     
-    $script:TotalSteps = $tasks.Count
-    $script:StepIndex = 0
     Reset-CleanupProgress
 
     $modeNote = if ($preview) { 'nothing will be deleted' } else { 'planning, then revalidating and processing eligible candidates' }
@@ -1174,7 +1193,6 @@ function Invoke-CleanupRun {
     foreach ($task in $tasks) {
         $taskName = $task.Name
         $script:ActiveCategory = $taskName
-        $isParallel = $task.Parallel
 
         Start-Step -Name $taskName -Total $tasks.Count
 
@@ -1223,16 +1241,17 @@ function Invoke-CleanupRun {
                     Register-SkippedItem -Reason 'Windows servicing is restricted to C:' -Target 'DISM'
                     break
                 }
-                if ($script:IsPreview) {
-                    Write-CommandLog 'PREVIEW' 'DISM /Online /Cleanup-Image /StartComponentCleanup'
-                } else {
+                # The task loop is the planning pass, where $script:IsPreview is always
+                # true, so the old inline else-branch was dead code that never ran DISM.
+                # Queue the command; the execution phase runs it only in real runs.
+                if ($preview) { Write-CommandLog 'PREVIEW' 'DISM /Online /Cleanup-Image /StartComponentCleanup' }
+                $script:PendingActions += [PSCustomObject]@{ Name = 'DISM'; Category = 'DISM'; Action = {
                     $dism = Join-Path (Get-EnvPath 'SystemRoot') 'System32\dism.exe'
-                    try {
-                        & $dism /Online /Cleanup-Image /StartComponentCleanup | ForEach-Object { Write-CommandLog 'DISM' $_ }
-                        if ($LASTEXITCODE -notin @(0,3010)) { throw "DISM exited with code $LASTEXITCODE" }
-                        if ($LASTEXITCODE -eq 3010) { Write-CommandLog 'INFO' 'Restart Windows to finish component cleanup.' }
-                    } catch { Register-CleanupError -Path $dism -Category 'DISM' -Message $_.Exception.Message }
-                }
+                    Write-CommandLog 'RUN' 'DISM /Online /Cleanup-Image /StartComponentCleanup'
+                    & $dism /Online /Cleanup-Image /StartComponentCleanup | ForEach-Object { Write-CommandLog 'DISM' $_ }
+                    if ($LASTEXITCODE -notin @(0,3010)) { throw "DISM exited with code $LASTEXITCODE" }
+                    if ($LASTEXITCODE -eq 3010) { Write-CommandLog 'INFO' 'Restart Windows to finish component cleanup.' }
+                } }
             }
              'Event Logs + Font Cache' { 
                  $null = Clear-EventLogs
@@ -1386,7 +1405,24 @@ function Invoke-CleanupRun {
         }
         $records.Add($row)
     }
+    $restartServices = @()
+    try {
     if (-not $preview) {
+        # Stop the services holding Windows Update download files so candidates
+        # under SoftwareDistribution are not deleted mid-write; restarted below.
+        foreach ($svc in @($script:PendingServices | Select-Object -Unique)) {
+            $s = Get-Service $svc -EA SilentlyContinue
+            if ($s -and $s.Status -ne 'Stopped') {
+                Write-CommandLog 'STOP' $svc
+                Stop-Service $svc -Force -EA SilentlyContinue
+                $restartServices += $svc
+            }
+        }
+    }
+    if (-not $preview) {
+        # One process snapshot per execution phase: enumerating for every candidate
+        # cost a full Get-Process walk per row (seconds on orphan-heavy runs).
+        $runningNow = Get-RunningProcessNames
         foreach ($row in $candidates) {
             $script:PartialActedBytes = 0L
             $script:PartialOutcomeKnown = $true
@@ -1398,7 +1434,6 @@ function Invoke-CleanupRun {
                 }
                 $current = [Bakunawa.Scanner]::Inspect($row.Path, [string[]]@(Get-CoreExcludedPaths))
                 if ($current.Bytes -ne $row.Measurement.Bytes -or $current.Files -ne $row.Measurement.Files -or $current.LatestWriteUtc -ne $row.Measurement.LatestWriteUtc) { throw 'Changed since scan; rescan required.' }
-                $runningNow = Get-RunningProcessNames
                 foreach ($app in $script:DefinitionPaths) {
                     if (-not $app.Process -or -not (Test-AnyProcessRunning -RunningProcesses $runningNow -Names @($app.Process))) { continue }
                     if ([Bakunawa.Scanner]::Within($row.Path, $app.Path) -or [Bakunawa.Scanner]::Within($app.Path, $row.Path)) { throw "In use: $($app.Name)" }
@@ -1414,11 +1449,22 @@ function Invoke-CleanupRun {
             }
         }
     }
+    if (-not $preview) {
+        foreach ($pending in @($script:PendingActions)) {
+            try { & $pending.Action }
+            catch { Register-CleanupError -Path $pending.Name -Category $pending.Category -Message $_.Exception.Message }
+        }
+    }
+    $script:PendingActions = @()
+    $script:PendingServices = @()
+    } finally {
+        foreach ($svc in $restartServices) { Write-CommandLog 'START' $svc; Start-Service $svc -EA SilentlyContinue }
+    }
     $categoryReport = @(foreach ($group in @($records | Group-Object Category)) {
         $identified = [long](($group.Group | Measure-Object Bytes -Sum).Sum)
         $acted = [long](($group.Group | Measure-Object ActedBytes -Sum).Sum)
         $unknownOutcomes = @($group.Group | Where-Object { -not $_.OutcomeKnown }).Count
-        $reasons = @(foreach ($reason in @($group.Group | Where-Object { $_.Status -ne 'Acted' } | Group-Object { if ($_.Reason) { $_.Reason } else { 'preview' } })) {
+        $reasons = @(foreach ($reason in @($group.Group | Where-Object { $_.Status -ne 'Acted' } | Group-Object { if ($_.Reason) { $_.Reason } else { 'eligible' } })) {
             [pscustomobject]@{ Reason = $reason.Name; Bytes = $(if (@($reason.Group | Where-Object { -not $_.OutcomeKnown }).Count) { $null } else { [long](($reason.Group | Measure-Object Bytes -Sum).Sum) - [long](($reason.Group | Measure-Object ActedBytes -Sum).Sum) }); UnknownSizePaths = @($reason.Group | Where-Object { $null -eq $_.Bytes }).Count }
         })
         [pscustomobject]@{ Category = $group.Name; IdentifiedBytes = $identified; ActedBytes = $(if ($unknownOutcomes) { $null } else { $acted }); NotActedBytes = $(if ($unknownOutcomes) { $null } else { $identified - $acted }); ConfirmedActedBytes = $acted; Reasons = $reasons; UnknownSizePaths = @($group.Group | Where-Object { $null -eq $_.Bytes }).Count; UnknownOutcomePaths = $unknownOutcomes }
@@ -1487,8 +1533,9 @@ function Clear-PackageManagerCaches {
     
     # pip cache (Python)
     $pipCache = @(
-        (Join-EnvPath 'LOCALAPPDATA' 'pip\Cache'),
-        (Join-EnvPath 'USERPROFILE' 'AppData\Local\pip\Cache')
+        # %LOCALAPPDATA%\pip\Cache is the same directory as the old
+        # %USERPROFILE%\AppData\Local\pip\Cache entry.
+        (Join-EnvPath 'LOCALAPPDATA' 'pip\Cache')
     )
     foreach ($pc in $pipCache) {
         if ($pc) {
@@ -1536,11 +1583,13 @@ function Clear-AIAgentCaches {
     param()
     Write-CommandLog 'SCAN' 'AI Agent Caches'
     $cat = 'AI Agent Caches'; $n = 0
-    $minAgeDays = 3
 
     # Get-AllAppDefinitions already resolves env+path to a full path.
     foreach ($app in @(Get-AllAppDefinitions -Category 'AI Agent Caches')) {
         if (-not $app.Path) { continue }
+        # A positive per-definition minAgeDays raises the guardrail for that location;
+        # the default stays the documented 3 days.
+        $minAgeDays = if ($app.MinAgeDays -gt 0) { $app.MinAgeDays } else { 3 }
         foreach ($resolvedPath in @(Expand-WildcardPath -Path $app.Path -DirectoriesOnly)) {
             if (-not $resolvedPath) { continue }
             if (-not (Test-Path -LiteralPath $resolvedPath -PathType Container)) { continue }
@@ -1565,7 +1614,6 @@ Export-ModuleMember -Function @(
     'Get-TransientAgeDays',
     'Clear-SystemCaches',
     'Clear-ChromiumCaches',
-    'Clear-FirefoxCaches',
     'Clear-AppCaches',
     'Clear-DevCaches',
     'Clear-GpuAndShellCaches',

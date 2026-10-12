@@ -8,7 +8,7 @@ function Get-ScanDriveRoots {
 function Initialize-CleanupState {
     [CmdletBinding()]
     param([hashtable]$Config, [string[]]$ScanRoot, [string[]]$ExtraExcludePath,
-        [switch]$VerboseScan, [switch]$Aggressive)
+        [switch]$VerboseScan, [switch]$Aggressive, [string]$ModeName)
     if ($PSBoundParameters.ContainsKey('VerboseScan')) { $script:VerboseScan = [bool]$VerboseScan }
     if ($PSBoundParameters.ContainsKey('Aggressive')) { $script:IsAggressive = [bool]$Aggressive }
     if (-not $Config) { $Config = Get-UserConfig }
@@ -16,7 +16,7 @@ function Initialize-CleanupState {
     if ($PSBoundParameters.ContainsKey('ScanRoot')) { $script:ScanRoots = $ScanRoot }
     if (-not $script:ScanRoots -and $Config.scanSettings.roots) { $script:ScanRoots = $Config.scanSettings.roots }
     if ($PSBoundParameters.ContainsKey('ExtraExcludePath')) { $script:ExtraExcludePaths = $ExtraExcludePath }
-    $null = Initialize-CoreSafetyState -Config $Config -ExtraExcludePath $script:ExtraExcludePaths
+    $null = Initialize-CoreSafetyState -Config $Config -ExtraExcludePath $script:ExtraExcludePaths -ModeName $ModeName
     $script:SysLoc = Get-SystemLocations
     $script:RunningProcesses = Get-RunningProcessNames
     $script:ProcessedCacheRoots = New-TrackedSet
@@ -184,12 +184,11 @@ function Invoke-OrphanDiscovery {
     }
 
     $watch = [Diagnostics.Stopwatch]::StartNew()
-    Write-ReportHeading 'DISCOVERY / READ ONLY'
-    Write-ReportMetric 'Scope' 'Local disk C: only'
-    Write-ReportMetric 'Roots selected' ([string]$rootsToScan.Count)
-    Write-ReportMetric 'Minimum age' ("$OlderThanDays days")
-    Write-ReviewLine 'Preparing application ownership checks, then walking each root. Total size is unknown.'
-    Write-ReviewLine 'Progress candidates are provisional; nested findings are combined after scanning.' -ForegroundColor Gray
+    # The run header already states the mode, scope and start time. Discovery
+    # adds only what is unique to a walk, and leaves the detail in the log.
+    Write-ReportRow ('{0,-16}{1} root · minimum age {2} days · nothing is deleted' -f 'Discovery', $rootsToScan.Count, $OlderThanDays) -Color DarkGray
+    Write-UiProgress 'Preparing application ownership checks'
+    Write-ScanLogText ("SCAN SETTINGS | roots={0} | minAgeDays={1} | exclusions={2}" -f $rootsToScan.Count, $OlderThanDays, $exclusions.Count)
     foreach ($path in $exclusions) { Write-ScanLogText ("EXCLUSION | {0}" -f $path) }
     $findings = [Collections.Generic.List[object]]::new()
     $issues = [Collections.Generic.List[object]]::new()
@@ -217,7 +216,10 @@ function Invoke-OrphanDiscovery {
             $directories = 0L; $errors = 0; $skipped = 0; $files = 0L
             $rootUnavailable = $false
             $visited = 0L
-            Write-CommandLog 'SCAN' $root
+            # Log only: the console already shows this root in the status line,
+            # and a "[CMD] SCAN ..." line between the header and the walk reads
+            # as leftover debug output.
+            Write-ScanLogText ("SCAN | {0}" -f $root)
             Write-ScanProgress -Root $root -RootIndex $rootIndex -RootCount $rootsToScan.Count -Candidates $findings.Count -Seconds $watch.Elapsed.TotalSeconds -CurrentPath $root -Force
             foreach ($entry in [Bakunawa.Scanner]::Walk($root, [string[]]($exclusions + @($script:BusyCachePaths)), $true)) {
                 if ($entry.Kind -eq 'Progress') { $visited = $entry.Files }
@@ -302,14 +304,15 @@ function Invoke-OrphanDiscovery {
             $coverage.Add([pscustomobject]@{ Root = $root; Directories = $directories; Files = $files; Errors = $errors; Skipped = $skipped
                 Visited = ($directories -gt 0 -and -not $rootUnavailable); DurationSec = [math]::Round($driveWatch.Elapsed.TotalSeconds, 2)
                 Status = $(if ($rootUnavailable -or -not $directories) { 'Unavailable or excluded' } elseif ($errors -or $skipped) { 'Incomplete' } else { 'Complete' }) })
-            Write-ReviewLine ("Root {0}/{1} finished | {2:N0} files | {3:N0} folders | {4:N0} errors | {5:N0} excluded / skipped | {6}" -f $rootIndex, $rootsToScan.Count, $files, $directories, $errors, $skipped, (Format-ReportDuration $driveWatch.Elapsed.TotalSeconds))
+            Clear-UiProgress
+            Write-ReportRow ('{0,-16}{1} · {2} · {3}{4}' -f 'Scanned', (Format-Count $files 'file'), (Format-Count $findings.Count 'candidate'), (Format-ReportDuration $driveWatch.Elapsed.TotalSeconds), $(if ($errors -or $skipped) { " · $errors errors · $skipped skipped" } else { '' })) -Color $(if ($errors -or $skipped) { 'Yellow' } else { 'Gray' })
         }
     } finally {
-        Write-Progress -Id 2 -Activity 'Bakunawa discovery' -Completed
+        Clear-UiProgress
         if ($script:ShortcutShell) { [void][Runtime.InteropServices.Marshal]::ReleaseComObject($script:ShortcutShell); $script:ShortcutShell = $null }
     }
     # Keep non-overlapping outermost findings: a folder includes its children's bytes.
-    Write-ReviewLine 'Finalizing report: combining nested candidates and totaling data...' -ForegroundColor Cyan
+    Write-UiProgress 'Combining nested candidates'
     $selected = New-TrackedSet
     $unique = [Collections.Generic.List[object]]::new()
     foreach ($finding in ($findings | Sort-Object { $_.Path.Length })) {

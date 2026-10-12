@@ -1,2 +1,5 @@
 # Deepwork session state (git-local, OpenCode-readable via .ignore)
 .slim/deepwork/
+
+# Stray run logs
+/preview_out.log

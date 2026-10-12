@@ -9,6 +9,6 @@ Profiles contain only these supported fields:
 
 An explicitly supplied `-Mode` always wins, including Preview. Preview always plans Standard candidates. `-VerboseScan` is passed explicitly into discovery and prints each visited scanner entry.
 
-Standard and Aggressive use the same task categories and safety/evidence checks. Their sole difference is the orphan age threshold in the active user configuration: `scanSettings.minAgeDays` (default 30) versus `scanSettings.aggressiveMinAgeDays` (default 14). Both use the newest UTC LastWriteTime across files and directories in the candidate tree. Neither uses LastAccessTime.
+Standard and Aggressive share the Standard task set and all safety/evidence checks; Aggressive adds Prefetch, `Event Logs + Font Cache` (font cache only — event logs are retained), and DISM on top. Aggressive also lowers the orphan age threshold in the active user configuration: `scanSettings.minAgeDays` (default 30) versus `scanSettings.aggressiveMinAgeDays` (default 14). Both use the newest UTC LastWriteTime across files and directories in the candidate tree. Neither uses LastAccessTime. The `DISM` task defaults to disabled because component cleanup can run for many minutes; enable it in `%APPDATA%\Bakunawa\config.json` when wanted.
 
 Other old profile fields were unused and have been removed from the bundled profiles. Task switches and exclusions remain in `%APPDATA%\Bakunawa\config.json`.

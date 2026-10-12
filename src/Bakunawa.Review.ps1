@@ -17,20 +17,6 @@
     if ($remaining) { Write-Host ($indent + $remaining) -ForegroundColor $ForegroundColor }
 }
 
-function Write-ReportHeading {
-    param([string]$Title, [ConsoleColor]$Color = 'Cyan')
-    Write-ReviewLine
-    Write-ReviewLine ('=' * [math]::Max(1, [math]::Min(72, (Get-ConsoleWidth) - 4))) -ForegroundColor $Color
-    Write-ReviewLine $Title -ForegroundColor $Color
-    Write-ReviewLine ('-' * [math]::Max(1, [math]::Min(72, (Get-ConsoleWidth) - 4))) -ForegroundColor DarkGray
-}
-
-function Write-ReportMetric {
-    param([string]$Label, [string]$Value, [ConsoleColor]$Color = 'White')
-    if ((Get-ConsoleWidth) -lt 60) { Write-ReviewLine ("{0}: {1}" -f $Label, $Value) -ForegroundColor $Color }
-    else { Write-ReviewLine ('{0,-24} : {1}' -f $Label, $Value) -ForegroundColor $Color }
-}
-
 function Format-ReportDuration {
     param([double]$Seconds)
     $duration = [TimeSpan]::FromSeconds([math]::Max(0, $Seconds))
@@ -46,15 +32,11 @@ function Export-ScanReport {
 
 function Show-ScanCoverage {
     param([object[]]$Coverage)
-    if (-not @($Coverage | Where-Object { $_ }).Count) { return }
-    Write-ReviewLine
-    Write-ReviewLine 'SCAN COVERAGE' -ForegroundColor Cyan
-    foreach ($drive in ($Coverage | Where-Object { $_ })) {
-        $color = if ($drive.Errors -gt 0 -or $drive.Skipped -gt 0 -or $drive.Status -notin @('Complete','Complete within exclusions')) { 'Yellow' } else { 'Green' }
-        Write-ReviewLine $drive.Root
-        Write-ReportMetric '  Status' $drive.Status -Color $color
-        Write-ReportMetric '  Files / folders' ('{0:N0} / {1:N0}' -f $drive.Files, $drive.Directories)
-        Write-ReportMetric '  Errors / excluded' ('{0:N0} / {1:N0}' -f $drive.Errors, $drive.Skipped) -Color $(if ($drive.Errors) { 'Yellow' } else { 'Gray' })
+    $roots = @($Coverage | Where-Object { $_ })
+    if (-not $roots.Count) { return }
+    foreach ($drive in $roots) {
+        $color = if ($drive.Errors -gt 0 -or $drive.Skipped -gt 0 -or $drive.Status -notin @('Complete','Complete within exclusions')) { 'Yellow' } else { 'Gray' }
+        Write-ReportRow ('{0,-16}{1} · {2} · {3} skipped · {4}' -f (Get-DisplayText (Get-PathTail $drive.Root 2) 15), $drive.Status, (Format-Count $drive.Files 'file'), (Format-Count $drive.Skipped 'path'), (Format-ReportDuration $drive.DurationSec)) -Color $color
     }
 }
 
@@ -71,32 +53,37 @@ function Show-ScanSummary {
     $status = if ($scanErrors -gt 0 -or $partial -gt 0 -or $excluded -gt 0) { 'Incomplete - finished with coverage gaps' }
               elseif (-not $coverage.Count) { 'Coverage not recorded' }
               else { 'Complete' }
-    Write-ReportHeading 'SCAN SUMMARY'
-    Write-ReportMetric 'Scope' 'Local disk C: only'
-    Write-ReportMetric 'Status' $status -Color $(if ($scanErrors -or $partial -or -not $coverage.Count) { 'Yellow' } else { 'Green' })
-    Write-ReportMetric 'Elapsed' (Format-ReportDuration $ScanResult.DurationSec)
-    Write-ReportMetric 'Scan roots' ('{0:N0}' -f $coverage.Count)
-    Write-ReportMetric 'Roots visited / skipped' ('{0} / {1}' -f @($ScanResult.RootsVisited).Count, @($ScanResult.RootsSkipped).Count)
-    Write-ReportMetric 'Files / folders scanned' ('{0:N0} / {1:N0}' -f [long](($coverage | Measure-Object Files -Sum).Sum), [long](($coverage | Measure-Object Directories -Sum).Sum))
-    Write-ReportMetric $(if ($Review) { 'Candidates remaining' } else { 'Candidates found' }) ('{0:N0}' -f $findings.Count) -Color Cyan
-    Write-ReportMetric 'Candidate data' (Format-FileSize (($findings | Measure-Object Size -Sum).Sum)) -Color Cyan
-    Write-ReportMetric 'Eligible orphans' ('{0:N0} ({1})' -f $safe.Count, (Format-FileSize (($safe | Measure-Object Size -Sum).Sum)))
-    Write-ReportMetric 'Review required' ('{0:N0} ({1})' -f ($findings.Count - $safe.Count), (Format-FileSize (($findings | Where-Object { -not $_.SafeDelete } | Measure-Object Size -Sum).Sum))) -Color $(if ($findings.Count -gt $safe.Count) { 'Yellow' } else { 'Gray' })
-    Write-ReportMetric 'Scan errors' ('{0:N0}' -f $scanErrors) -Color $(if ($scanErrors) { 'Red' } else { 'Gray' })
-    Write-ReportMetric 'Excluded / skipped' ('{0:N0}' -f $excluded) -Color Gray
-    Write-ReviewLine ('-' * [math]::Min(72, (Get-ConsoleWidth) - 4)) -ForegroundColor DarkGray
-    Write-ReviewLine 'Discovery does not delete files. Candidate data is not reclaimed space.' -ForegroundColor Gray
-    if ($scanErrors -or $partial) { Write-ReviewLine 'Some locations were not fully scanned. Check coverage and issues before acting.' -ForegroundColor Yellow }
-    if ($ScanResult.TextLogPath -and -not $script:ScanLogFailed) { Write-ReviewLine ("Full report: {0}" -f $ScanResult.TextLogPath) -ForegroundColor Cyan }
+    # Four rows answer the whole scan: how much space, how much is reclaimable,
+    # how much was covered, and whether the walk can be trusted. The full
+    # breakdown stays in the text log instead of scrolling past.
+    $label = '{0,-16}' -f ''
+    $files = [long](($coverage | Measure-Object Files -Sum).Sum)
+    $folders = [long](($coverage | Measure-Object Directories -Sum).Sum)
+    $bytes = [long](($findings | Measure-Object Size -Sum).Sum)
+    $safeBytes = [long](($safe | Measure-Object Size -Sum).Sum)
+    Clear-UiProgress
+
+    Write-ReportTitle 'Scan complete' -Meta (Format-ReportDuration $ScanResult.DurationSec)
+    $comparison = Get-StorageComparison
+    if ($comparison) { Write-StorageLine $comparison -Note 'unchanged - read-only run' }
+    # Without a drive comparison (preview) the total needs a label of its own,
+    # otherwise every row in the block starts with a blank column.
+    $totalLabel = if ($comparison) { '{0,-16}' -f '' } else { '{0,-16}' -f 'Found' }
+    Write-ReportRow ('{0}{1} in {2}' -f $totalLabel, (Format-FileSize $bytes), (Format-Count $findings.Count 'candidate')) -Color Cyan
+    Write-ReportRow ('{0}{1} in {2} · {3:N0} needing review' -f $label, (Format-FileSize $safeBytes), (Format-Count $safe.Count 'eligible orphan'), ($findings.Count - $safe.Count)) -Color $(if ($findings.Count -gt $safe.Count) { 'Yellow' } else { 'Gray' })
+    Write-ReportRow ('{0}{1} · {2} · {3} skipped' -f $label, (Format-Count $files 'file'), (Format-Count $folders 'folder'), (Format-Count $excluded 'path')) -Color Gray
+    Write-ReportRow ('{0}{1}' -f $label, $status) -Color $(if ($scanErrors -or $partial -or -not $coverage.Count) { 'Yellow' } else { 'Green' })
+    if ($scanErrors -or $partial) { Write-ReportRow '  Some locations were not fully scanned. Check coverage and issues before acting.' -Color Yellow }
+    Show-ScanCoverage -Coverage $ScanResult.Coverage
     if ($findings.Count) {
-        Write-ReviewLine
-        Write-ReviewLine 'DATA BY CATEGORY / largest first' -ForegroundColor Cyan
         $groups = @($findings | Group-Object Category | ForEach-Object {
             [pscustomobject]@{ Name = $_.Name; Count = $_.Count; Bytes = [long](($_.Group | Measure-Object Size -Sum).Sum) }
         } | Sort-Object Bytes -Descending)
-        foreach ($group in $groups) { Write-ReportMetric $group.Name ('{0,10} | {1:N0} items' -f (Format-FileSize $group.Bytes), $group.Count) }
-        Write-ReviewLine 'Next: Preview [3] for routine cleanup; Scan C: [4] to review and delete selections.' -ForegroundColor Cyan
+        Write-ReportRow ''
+        foreach ($group in $groups) { Write-ReportRow ('{0}{1,10}  {2}' -f $label, (Format-FileSize $group.Bytes), (Format-Count $group.Count 'item')) -Color DarkGray }
+        Write-ReportRow 'Next: Preview [3] for routine cleanup; Scan C: [4] to review and delete selections.' -Color DarkCyan
     }
+    if ($ScanResult.TextLogPath -and -not $script:ScanLogFailed) { Write-ReportRow ('Full report  {0}' -f $ScanResult.TextLogPath) -Color DarkGray -Raw }
 }
 
 function Show-OrphanScanResults {
@@ -107,37 +94,39 @@ function Show-OrphanScanResults {
     $page = 0; $pageSize = 10
     do {
         Show-ScanSummary -ScanResult $ScanResult -Review:$Interactive
-        Show-ScanCoverage -Coverage $ScanResult.Coverage
-        Write-ReviewLine
-        Write-ReviewLine 'CANDIDATE REVIEW / largest first' -ForegroundColor Cyan
-        Write-ReviewLine ('-' * [math]::Min(72, (Get-ConsoleWidth) - 4))
+        Write-ReportRow ''
+        Write-ReportTitle 'Candidates' -Meta ('{0} found' -f $findings.Count)
         $safe = @($findings | Where-Object SafeDelete)
         $bytes = ($findings | Measure-Object Size -Sum).Sum
-        Write-ReviewLine ("{0} candidates | {1} | {2} eligible orphans | {3} need review" -f $findings.Count, (Format-FileSize $bytes), $safe.Count, ($findings.Count - $safe.Count))
-        Write-ReviewLine 'Finding a candidate does not delete it. Age alone does not prove it is unused.'
-        if (-not $findings.Count) { Write-ReviewLine 'No candidates found within the scanned scope.' }
+        Write-ReportRow ('{0,-16}{1} · {2:N0} eligible · {3:N0} need review' -f 'Size', (Format-FileSize $bytes), $safe.Count, ($findings.Count - $safe.Count)) -Color Cyan
+        Write-ReportRow 'Finding a candidate does not delete it. Age alone does not prove it is unused.' -Color DarkGray
+        if (-not $findings.Count) { Write-ReportRow 'No candidates found within the scanned scope.' -Color Gray }
         $start = if ($Interactive) { $page * $pageSize } else { 0 }
         $end = if ($Interactive -or $hasFullLog) { [math]::Min($start + $pageSize, $findings.Count) } else { $findings.Count }
         for ($i = $start; $i -lt $end; $i++) {
             $item = $findings[$i]
-            Write-ReviewLine
-            $action = if ($item.SafeDelete) { 'Eligible orphan' } else { 'Review required' }
-            Write-ReviewLine ("[{0}] {1} | {2} | {3} days" -f ($i + 1), $item.Category, (Format-FileSize $item.Size), $item.DaysSinceModified) -ForegroundColor $(if ($item.SafeDelete) { 'Cyan' } else { 'Yellow' })
-            Write-ReviewLine $item.Path
-            Write-ReviewLine ("{0}: {1}" -f $action, $item.Reason) -ForegroundColor Gray
+            # Two rows per candidate: what it is on one line, where it is on the
+            # next. Three rows per item buried the list under its own labels.
+            $color = if ($item.SafeDelete) { 'Cyan' } else { 'Yellow' }
+            $action = if ($item.SafeDelete) { 'eligible' } else { 'review' }
+            Write-ReportRow ('{0,3}  {1,10}  {2,-24} {3,5} d  {4}' -f ($i + 1), (Format-FileSize $item.Size), $item.Category, $item.DaysSinceModified, $action) -Color $color
+            Write-ReportRow ('     {0}' -f $item.Path) -Color Gray
         }
         $issues = @($ScanResult.Issues | Where-Object { $_ })
         if ($issues.Count) {
-            Write-ReportHeading 'SCAN ISSUES' -Color Yellow
-            foreach ($issue in $issues) { Write-ReviewLine ("{0}: {1} - {2}" -f $issue.Kind, $issue.Path, $issue.Reason) -ForegroundColor $(if ($issue.Kind -eq 'Error') { 'Red' } else { 'Gray' }) }
+            Write-ReportTitle 'Scan issues' -Meta (Format-Count $issues.Count 'entry')
+            foreach ($issue in $issues) {
+                Write-ReportRow ('{0,-10}{1}' -f $issue.Kind, $issue.Path) -Color $(if ($issue.Kind -eq 'Error') { 'Red' } else { 'Yellow' })
+                Write-ReportRow ('{0}{1}' -f (' ' * 10), $issue.Reason) -Color DarkGray
+            }
         }
         if (-not $Interactive) {
-            if ($end -lt $findings.Count) { Write-ReviewLine ("Showing the largest {0} of {1} candidates. Every candidate and reason is in the text log." -f $end, $findings.Count) -ForegroundColor Cyan }
+            if ($end -lt $findings.Count) { Write-ReportRow ("Showing the largest {0} of {1}. Every candidate and reason is in the full report." -f $end, (Format-Count $findings.Count 'candidate')) -Color Cyan }
             return
         }
-        Write-ReviewLine
-        Write-ReviewLine ("Page {0}/{1} | N next | P previous | E export | I scan issues | Q return" -f ($page + 1), [math]::Max(1, [math]::Ceiling($findings.Count / $pageSize)))
-        Write-ReviewLine 'Enter item numbers separated by commas to review a selection.'
+        Write-ReportRow ''
+        Write-ReportRow ("Page {0}/{1} · N next · P previous · E export · I scan issues · Q return" -f ($page + 1), [math]::Max(1, [math]::Ceiling($findings.Count / $pageSize))) -Color DarkGray
+        Write-ReportRow 'Enter item numbers separated by commas to review a selection.' -Color DarkGray
         $choice = (Read-Host 'Review').Trim()
         switch ($choice.ToUpperInvariant()) {
             'Q' { return }
@@ -154,8 +143,15 @@ function Show-OrphanScanResults {
                 continue
             }
             'I' {
-                foreach ($issue in @($ScanResult.Issues)) { if ($issue) { Write-ReviewLine ("{0}: {1} - {2}" -f $issue.Kind, $issue.Path, $issue.Reason) } }
-                if (-not @($ScanResult.Issues).Count) { Write-ReviewLine 'No scan issues.' }
+                # The same protected path is reported by every walker that meets
+                # it. The log keeps each occurrence; the screen shows each once.
+                $issues = @($ScanResult.Issues | Where-Object { $_ } | Sort-Object Kind, Path, Reason -Unique)
+                Write-ReportTitle 'Scan issues' -Meta ('{0} entries' -f $issues.Count)
+                if (-not $issues.Count) { Write-ReportRow 'No scan issues.' -Color Gray }
+                foreach ($issue in $issues) {
+                    Write-ReportRow ('{0,-10}{1}' -f $issue.Kind, $issue.Path) -Color $(if ($issue.Kind -eq 'Error') { 'Red' } else { 'Yellow' })
+                    Write-ReportRow ('{0}{1}' -f (' ' * 10), $issue.Reason) -Color DarkGray
+                }
                 [void](Read-Host 'Press Enter to return to review'); continue
             }
         }
@@ -197,47 +193,87 @@ function Show-OrphanScanResults {
     } while ($true)
 }
 
+# Bytes that were never measured stay honest instead of printing a zero.
+function Format-ReportSize {
+    param($Bytes)
+    if ($null -eq $Bytes) { 'unknown' } else { Format-FileSize $Bytes }
+}
+
 function Show-CleanupResult {
     param([Parameter(Mandatory)]$Result)
     Set-UiContext -Mode $Result.Mode -Result $Result
     $errors = @($Result.Errors | Where-Object { $_ })
     $skips = @($Result.SkippedItems | Where-Object { $_ })
-    Write-ReportHeading $(if ($Result.IsPreview) { 'PREVIEW SUMMARY' } else { 'CLEANUP SUMMARY' })
-    Write-ReportMetric 'Mode' $Result.Mode
-    Write-ReportMetric 'Scope' 'Local disk C: only'
-    Write-ReportMetric 'Status' $(if ($errors.Count) { 'Finished with errors' } else { 'Finished' }) -Color $(if ($errors.Count) { 'Yellow' } else { 'Green' })
-    Write-ReportMetric 'Elapsed' (Format-ReportDuration $Result.DurationSec)
-    Write-ReportMetric $(if ($Result.IsPreview) { 'Paths previewed' } else { 'Paths processed' }) ('{0:N0}' -f $Result.PathsCleared)
-    Write-ReportMetric $(if ($Result.IsPreview) { 'Estimated eligible data' } elseif ($Result.UnknownOutcomePaths) { 'Confirmed deleted data' } else { 'Deleted data' }) (Format-FileSize $Result.BytesFreed) -Color Cyan
-    Write-ReportMetric 'Errors / skipped' ('{0:N0} / {1:N0}' -f $errors.Count, $skips.Count) -Color $(if ($errors.Count -or $skips.Count) { 'Yellow' } else { 'Gray' })
-    if ($Result.IsPreview) { Write-ReviewLine 'Preview only. No files were deleted; sizes are estimates.' -ForegroundColor Gray }
-    else { Write-ReviewLine 'Deletion is permanent and the space is reclaimed immediately.' -ForegroundColor Gray }
-    if ($Result.PSObject.Properties['IsComplete'] -and -not $Result.IsComplete) { Write-ReviewLine 'INCOMPLETE: some paths could not be inspected. Elevated runs can identify additional candidates.' -ForegroundColor Yellow }
-    if ($Result.UnknownOutcomePaths) { Write-ReviewLine ("{0} failed action(s) could not be remeasured. Confirmed totals are lower bounds." -f $Result.UnknownOutcomePaths) -ForegroundColor Yellow }
-    foreach ($category in @($Result.CategoryReport)) {
-        if (-not $category) { continue }
-        Write-ReviewLine ("{0}: identified {1}; acted on {2}; not acted on {3}; unknown-size paths {4}" -f $category.Category, $category.IdentifiedBytes, $(if ($null -eq $category.ActedBytes) { 'unknown' } else { $category.ActedBytes }), $(if ($null -eq $category.NotActedBytes) { 'unknown' } else { $category.NotActedBytes }), $category.UnknownSizePaths)
-        foreach ($reason in $category.Reasons) { Write-ReviewLine ("  {0}: {1} bytes; {2} unknown-size paths" -f $reason.Reason, $(if ($null -eq $reason.Bytes) { 'unknown' } else { $reason.Bytes }), $reason.UnknownSizePaths) }
+    $comparison = Get-StorageComparison
+    Clear-UiProgress
+    Write-ReportTitle $(if ($Result.IsPreview) { 'Preview complete' } else { 'Cleanup complete' }) -Meta (Format-ReportDuration $Result.DurationSec)
+    if ($Result.IsPreview) {
+        Write-ReportRow 'Dry run          nothing was deleted · sizes are estimates' -Color DarkGray
+        Write-ReportRow ('Reclaimable      {0} · {1} would change' -f (Format-FileSize $Result.BytesFreed), (Format-Count $Result.PathsCleared 'path')) -Color Cyan
+    } else {
+        # Observed free-space change next to the measured deleted total: the first
+        # is what the drive reports, the second is what Bakunawa removed.
+        if ($comparison) {
+            $note = if ($comparison.Change -gt 0) { '+{0} freed' -f (Format-FileSize $comparison.Change) }
+                elseif ($comparison.Change -lt 0) { '{0} lost' -f (Format-FileSize ([math]::Abs($comparison.Change))) }
+                else { 'no change' }
+            Write-StorageLine $comparison -Note $note
+        }
+        Write-ReportRow ('Deleted          {0} on disk · {1} processed' -f (Format-FileSize $Result.BytesFreed), (Format-Count $Result.PathsCleared 'path')) -Color Cyan
+        Write-ReportRow ('Blocked          {0} · {1} failed' -f (Format-Count $skips.Count 'path'), (Format-Count $errors.Count 'action')) -Color $(if ($errors.Count -or $skips.Count) { 'Yellow' } else { 'Gray' })
+        Write-ReportRow 'Deletion is permanent and the space is reclaimed immediately.' -Color DarkGray
     }
-    foreach ($row in @($Result.Outcomes | Where-Object Status -eq 'Skipped')) {
-        Write-ReviewLine ("Skipped: {0} | {1} | {2}" -f $row.Path, $row.Reason, $row.Detail) -ForegroundColor Yellow
-    }
-    if ($Result.CategorySizes.Count) {
-        Write-ReportHeading $(if ($Result.IsPreview) { 'ESTIMATED DATA BY CATEGORY' } else { 'PROCESSED DATA BY CATEGORY' })
-        if (-not $Result.IsPreview) { Write-ReviewLine 'Category totals include deleted data.' -ForegroundColor Gray }
-        foreach ($category in ($Result.CategorySizes.GetEnumerator() | Sort-Object Value -Descending)) {
-            Write-ReportMetric $category.Key $(if ($null -eq $category.Value) { 'unknown' } else { Format-FileSize $category.Value })
+    if ($Result.PSObject.Properties['IsComplete'] -and -not $Result.IsComplete) { Write-ReportRow 'INCOMPLETE: some paths could not be inspected. Elevated runs can identify additional candidates.' -Color Yellow }
+    if ($Result.UnknownOutcomePaths) { Write-ReportRow ("{0} failed action(s) could not be remeasured. Confirmed totals are lower bounds." -f $Result.UnknownOutcomePaths) -Color Yellow }
+    $categoryRows = @($Result.CategoryReport | Where-Object { $_ })
+    if ($categoryRows.Count) {
+        Write-ReportTitle 'Identified data' -Meta (Format-ReportSize ([long](($categoryRows | ForEach-Object { $_.IdentifiedBytes } | Where-Object { $null -ne $_ } | Measure-Object -Sum).Sum)))
+        foreach ($category in $categoryRows) {
+            Write-ReportRow ('{0}{1} identified · {2} acted on · {3} left{4}' -f ('{0,-24}  ' -f (Get-DisplayText $category.Category 24)), (Format-ReportSize $category.IdentifiedBytes), (Format-ReportSize $category.ActedBytes), (Format-ReportSize $category.NotActedBytes), $(if ($category.UnknownSizePaths) { " · $(Format-Count $category.UnknownSizePaths 'unmeasured path')" } else { '' })) -Color DarkGray
+            foreach ($reason in @($category.Reasons)) {
+                if (-not $reason) { continue }
+                Write-ReportRow ('{0}{1,-18}{2}{3}' -f (' ' * 4), $reason.Reason, (Format-ReportSize $reason.Bytes), $(if ($reason.UnknownSizePaths) { " · $(Format-Count $reason.UnknownSizePaths 'unmeasured path')" } else { '' })) -Color DarkGray
+            }
         }
     }
-    if ($Result.ScanReport) { Show-ScanSummary -ScanResult $Result.ScanReport; Show-ScanCoverage -Coverage $Result.ScanReport.Coverage }
-    else { Write-ReviewLine 'Orphan discovery was not run; no drive coverage is reported.' -ForegroundColor Gray }
+    # Grouped by reason: the same explanation repeated per path is noise, and the
+    # paths are what the reader is actually scanning for.
+    $outcomeRows = @($Result.Outcomes | Where-Object Status -eq 'Skipped')
+    if ($outcomeRows.Count) {
+        Write-ReportTitle 'Skipped' -Meta (Format-Count $outcomeRows.Count 'item')
+        # A full-disk run reports thousands of skips. The screen stays bounded;
+        # the full report keeps every path and reason.
+        $shownPerReason = 10
+        foreach ($group in ($outcomeRows | Group-Object Reason)) {
+            $paths = @($group.Group | ForEach-Object Path)
+            Write-ReportRow ('{0} · {1}' -f $group.Name, (Format-Count $paths.Count 'path')) -Color Yellow
+            foreach ($path in @($paths | Select-Object -First $shownPerReason)) { Write-ReportRow ('{0}{1}' -f (' ' * 4), $path) -Color DarkGray }
+            if ($paths.Count -gt $shownPerReason) { Write-ReportRow ('{0}… {1} more in the full report' -f (' ' * 4), ($paths.Count - $shownPerReason)) -Color DarkGray }
+        }
+    }
+    # The category report already breaks the totals down per category; the flat
+    # map is only a fallback for runs that produced no per-category detail.
+    if (-not $categoryRows.Count -and $Result.CategorySizes.Count) {
+        Write-ReportTitle $(if ($Result.IsPreview) { 'Estimated data by category' } else { 'Processed data by category' })
+        foreach ($category in ($Result.CategorySizes.GetEnumerator() | Sort-Object Value -Descending)) {
+            Write-ReportRow ('{0}{1,10}' -f ('{0,-24}  ' -f (Get-DisplayText $category.Key 24)), (Format-ReportSize $category.Value)) -Color DarkGray
+        }
+    }
+    if ($Result.ScanReport) { Show-ScanSummary -ScanResult $Result.ScanReport }
+    else { Write-ReportRow 'Orphan discovery was not run; no drive coverage is reported.' -Color Gray }
     if ($errors.Count) {
-        Write-ReportHeading 'CLEANUP ERRORS' -Color Yellow
-        foreach ($failure in $errors) { Write-ReviewLine "$($failure.Path): $($failure.Error)" -ForegroundColor Yellow }
+        Write-ReportTitle 'Errors' -Meta (Format-Count $errors.Count 'item')
+        foreach ($failure in $errors) {
+            Write-ReportRow $failure.Path -Color Yellow
+            Write-ReportRow ('{0}{1}' -f (' ' * 4), $failure.Error) -Color DarkGray
+        }
     }
     if ($skips.Count) {
-        Write-ReportHeading 'SKIPPED ITEMS' -Color Yellow
-        foreach ($skip in $skips) { Write-ReviewLine "$($skip.Target): $($skip.Reason)" }
+        Write-ReportTitle 'Blocked' -Meta (Format-Count $skips.Count 'item')
+        foreach ($skip in $skips) {
+            Write-ReportRow $skip.Target -Color Yellow
+            Write-ReportRow ('{0}{1}' -f (' ' * 4), $skip.Reason) -Color DarkGray
+        }
     }
-    if (Get-ScanLogPath) { Write-ReviewLine ("Full report: {0}" -f (Get-ScanLogPath)) -ForegroundColor Cyan }
+    if (Get-ScanLogPath) { Write-ReportRow ('Full report  {0}' -f (Get-ScanLogPath)) -Color Cyan -Raw }
 }

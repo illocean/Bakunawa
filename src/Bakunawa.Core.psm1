@@ -5,41 +5,22 @@ if (-not ('Bakunawa.Scanner' -as [type])) {
     Add-Type -Path (Join-Path $PSScriptRoot 'Bakunawa.Scanner.cs') -ErrorAction Stop
 }
 # ── SCRIPT STATE ──
-$script:IsPreview        = $false
-$script:IsAggressive     = $false
-$script:CurrentModeName  = 'Menu'
-$script:StepIndex        = 0
-$script:TotalSteps       = 0
 $script:ExcludedPaths    = $null
-$script:LastRunSummary   = $null
-$script:BytesFreed       = [long]0
-$script:CategorySizes    = @{}
-$script:OrphanReport     = @()
 $script:SkippedItems     = @()
 $script:RunningProcesses = $null
-$script:ActiveStepName   = $null
-$script:ActiveStepPct    = 0
-$script:Errors           = @()
-$script:LogFilePath      = ''
 $script:HealthCache      = $null
 $script:TempSizeCache    = $null
-$script:LastOrphanRisks  = $null
-$script:OrphanCache      = $null
-$script:OrphanCacheTime  = $null
-$script:SysLoc           = $null
 $script:InstalledAppNames = $null
 
 function Get-FreeSpaceInfo {
     [CmdletBinding()]
     param([string]$DriveLetter)
-    $DriveLetter = 'C'
-    
     if (-not $DriveLetter) { $DriveLetter = 'C' }
     
     try {
         $driveInfo = [System.IO.DriveInfo]::new("${DriveLetter}:")
         if (-not $driveInfo.IsReady) { 
-            return [PSCustomObject]@{MB=0;GB=0;TotalMB=0;TotalGB=0;UsedMB=0;UsedGB=0}
+            return [PSCustomObject]@{MB=0;GB=0;TotalMB=0;TotalGB=0;UsedMB=0;UsedGB=0;FreeBytes=0;TotalBytes=0}
         }
         
         $freeBytes = [long]$driveInfo.AvailableFreeSpace
@@ -55,6 +36,10 @@ function Get-FreeSpaceInfo {
             TotalGB = [math]::Round($totalBytes / 1GB, 2)
             UsedMB = [math]::Round($usedBytes / 1MB)
             UsedGB = [math]::Round($usedBytes / 1GB, 2)
+            # Raw bytes so a before/after storage comparison is exact; the rounded
+            # MB/GB fields above cannot express a small difference.
+            FreeBytes = $freeBytes
+            TotalBytes = $totalBytes
         }
     } catch {
         Write-Verbose "Get-FreeSpaceInfo error: $_"
@@ -262,38 +247,6 @@ function Test-IsExcludedPath {
     return $false
 }
 
-function Get-DefaultApprovedRoots {
-    [CmdletBinding()]
-    $set = New-TrackedSet
-    foreach ($root in @(
-        (Get-EnvPath 'TEMP'),
-        (Get-EnvPath 'LOCALAPPDATA'),
-        (Get-EnvPath 'APPDATA'),
-        (Get-EnvPath 'USERPROFILE'),
-        $(if ($script:SysLoc) { $script:SysLoc.ProgramData }),
-        $(if ($script:SysLoc) { $script:SysLoc.WindowsRoot })
-    )) {
-        $resolved = Resolve-FullPath $root
-        if ($resolved) { [void]$set.Add($resolved) }
-    }
-    return @($set)
-}
-
-function Test-SafeCleanupTarget {
-    [CmdletBinding()]
-    param([string]$Path, [string[]]$ApprovedRoots = @(), [switch]$AllowRoot)
-    if (-not [Bakunawa.Scanner]::IsAllowedPath($Path)) { return $false }
-    $resolved = Resolve-FullPath $Path
-    if (-not $resolved -or (Test-IsExcludedPath $resolved)) { return $false }
-    $roots = @($ApprovedRoots | ForEach-Object { Resolve-FullPath $_ } | Where-Object { $_ })
-    if (-not $roots) { $roots = Get-DefaultApprovedRoots }
-    foreach ($root in $roots) {
-        if ($resolved.Equals($root, [StringComparison]::OrdinalIgnoreCase)) { return $AllowRoot.IsPresent }
-        if ($resolved.StartsWith("$root\", [StringComparison]::OrdinalIgnoreCase)) { return $true }
-    }
-    return $false
-}
-
 function Get-DisposableDirectoryNames {
     [CmdletBinding()]
     $names = New-TrackedSet
@@ -303,81 +256,6 @@ function Get-DisposableDirectoryNames {
         'temp','tmp','logs','log','crashpad','crashdumps','blob_storage'
     ) | ForEach-Object { [void]$names.Add($_) }
     return ,$names
-}
-
-function Test-IsDisposableLogPath {
-    [CmdletBinding()]
-    param([string]$Path, [string]$Root)
-    $resolvedPath = Resolve-FullPath $Path
-    $resolvedRoot = Resolve-FullPath $Root
-    if (-not $resolvedPath -or -not $resolvedRoot) { return $false }
-    if (-not $resolvedPath.StartsWith("$resolvedRoot\", [StringComparison]::OrdinalIgnoreCase)) { return $false }
-    $relativeDirectory = Split-Path -Parent $resolvedPath
-    if (-not $relativeDirectory.StartsWith("$resolvedRoot\", [StringComparison]::OrdinalIgnoreCase)) { return $false }
-    $segmentNames = (Split-Path -NoQualifier $relativeDirectory).TrimStart('\').Split('\', [StringSplitOptions]::RemoveEmptyEntries)
-    $disposableNames = Get-DisposableDirectoryNames
-    foreach ($segment in $segmentNames) {
-        if ($disposableNames.Contains($segment)) { return $true }
-    }
-    return $false
-}
-
-function Get-DisposableLogCandidates {
-    [CmdletBinding()]
-    param([string[]]$Roots, [int]$OlderThanDays = 14)
-    $cutoff = (Get-Date).AddDays(-$OlderThanDays)
-    $candidates = [System.Collections.Generic.List[System.IO.FileInfo]]::new()
-    foreach ($root in $Roots) {
-        $resolvedRoot = Resolve-FullPath $root
-        if (-not [Bakunawa.Scanner]::IsAllowedPath($resolvedRoot) -or -not (Test-Path -LiteralPath $resolvedRoot -PathType Container)) { continue }
-        $files = [System.Collections.Generic.List[System.IO.FileInfo]]::new()
-        foreach ($entry in [Bakunawa.Scanner]::Walk($resolvedRoot, [string[]]@(Get-CoreExcludedPaths))) {
-            if ($entry.Kind -eq 'File' -and [IO.Path]::GetExtension($entry.Path) -eq '.log') { $files.Add([IO.FileInfo]::new($entry.Path)) }
-        }
-        foreach ($file in $files) {
-            if ($file.LastWriteTime -ge $cutoff) { continue }
-            if (-not (Test-SafeCleanupTarget -Path $file.FullName -ApprovedRoots @($resolvedRoot) -AllowRoot)) { continue }
-            if (-not (Test-IsDisposableLogPath -Path $file.FullName -Root $resolvedRoot)) { continue }
-            $candidates.Add($file)
-        }
-    }
-    return $candidates
-}
-
-function Get-StaleDisposableDirectories {
-    [CmdletBinding()]
-    param([string[]]$Roots, [int]$OlderThanDays = 45)
-    $cutoff = (Get-Date).AddDays(-$OlderThanDays)
-    $disposableNames = Get-DisposableDirectoryNames
-    $candidates = [System.Collections.Generic.List[System.IO.DirectoryInfo]]::new()
-    foreach ($root in $Roots) {
-        $resolvedRoot = Resolve-FullPath $root
-        if (-not [Bakunawa.Scanner]::IsAllowedPath($resolvedRoot) -or -not (Test-Path -LiteralPath $resolvedRoot -PathType Container)) { continue }
-        foreach ($entry in [Bakunawa.Scanner]::Walk($resolvedRoot, [string[]]@(Get-CoreExcludedPaths))) {
-            if ($entry.Kind -notin @('Directory','EmptyDirectory') -or -not $entry.Complete -or $entry.LatestWriteUtc -ge $cutoff.ToUniversalTime()) { continue }
-            $directory = [IO.DirectoryInfo]::new($entry.Path)
-            if (-not $disposableNames.Contains($directory.Name)) { continue }
-            if (-not (Test-SafeCleanupTarget -Path $directory.FullName -ApprovedRoots @($resolvedRoot))) { continue }
-            $candidates.Add($directory)
-        }
-    }
-    return $candidates
-}
-
-function Get-JunkSweepRoots {
-    [CmdletBinding()]
-    $set = New-TrackedSet
-    foreach ($root in @(
-        (Get-EnvPath 'TEMP'),
-        (Join-EnvPath 'LOCALAPPDATA' 'Temp'),
-        $(if ($script:SysLoc) { $script:SysLoc.WindowsTemp }),
-        $(if ($script:SysLoc) { $script:SysLoc.SoftDistDL }),
-        $(if ($script:SysLoc) { $script:SysLoc.DeliveryOpt })
-    )) {
-        $resolved = Resolve-FullPath $root
-        if ($resolved) { [void]$set.Add($resolved) }
-    }
-    return @($set)
 }
 
 function Get-InstalledApplicationNames {
@@ -490,18 +368,24 @@ function Initialize-CoreSafetyState {
     [CmdletBinding()]
     param(
         [AllowEmptyCollection()][string[]]$ExtraExcludePath,
-        [hashtable]$Config
+        [hashtable]$Config,
+        [string]$ModeName
     )
     
     $custom = @($ExtraExcludePath)
     if ($Config -and $Config.exclusions) { $custom += @($Config.exclusions.userCustomExclusions) }
     $script:ExcludedPaths = Get-ExcludedPaths -ExtraExcludePath $custom
     $script:RunningProcesses = Get-RunningProcessNames
-    $script:SysLoc = Get-SystemLocations
     $script:SkippedItems = @()
 
     # Quarantine was removed: every delete is final and immediately reclaims disk space.
-    Write-CommandLog 'INFO' 'Deletes are permanent; use Preview to inspect the plan first.'
+    # The warning follows the mode: telling a read-only scan that deletes are
+    # permanent reads as a risk that does not exist.
+    switch ($ModeName) {
+        'Preview' { Write-CommandLog 'INFO' 'Preview only: nothing will be deleted.' }
+        'Scan'    { Write-CommandLog 'INFO' 'Read-only run: nothing will be deleted.' }
+        default   { Write-CommandLog 'INFO' 'Deletes are permanent; use Preview to inspect the plan first.' }
+    }
 
     return [PSCustomObject]@{
         ExcludedPathCount = if ($script:ExcludedPaths) { $script:ExcludedPaths.Count } else { 0 }
@@ -523,36 +407,6 @@ function Register-SkippedItem {
     [CmdletBinding()]
     param([string]$Reason, [string]$Target, [string]$Category = 'Discovery', [Nullable[long]]$Bytes)
     $script:SkippedItems += [PSCustomObject]@{ Reason = $Reason; Target = $Target; Category = $Category; Bytes = $Bytes }
-}
-
-function Get-OrphanRiskScore {
-    [CmdletBinding()]
-    param([string]$Name, [long]$SizeBytes, [int]$DaysStale, [string]$PathSuffix,
-          [string[]]$InstalledNames = @(), [string[]]$RunningNames = @())
-    $staleness = if ($DaysStale -ge 365) { 40 } elseif ($DaysStale -ge 90) { 30 } elseif ($DaysStale -ge 30) { 15 } else { 0 }
-    $sizeMB = $SizeBytes / 1MB
-    $sizeScore = if ($sizeMB -ge 500) { 20 } elseif ($sizeMB -ge 200) { 15 } elseif ($sizeMB -ge 50) { 10 } elseif ($sizeMB -ge 1) { 5 } else { 0 }
-    $installSignal = 0
-    $nameLower = $Name.ToLowerInvariant()
-    $foundExact = $false; $foundPartial = $false
-    foreach ($n in $InstalledNames) {
-        $nl = $n.ToLowerInvariant()
-        if ($nl -eq $nameLower) { $foundExact = $true; break }
-        if ($nl.Contains($nameLower) -or $nameLower.Contains($nl)) { $foundPartial = $true }
-    }
-    if (-not $foundExact) {
-        foreach ($n in $RunningNames) {
-            $nl = $n.ToLowerInvariant()
-            if ($nl -eq $nameLower) { $foundExact = $true; break }
-            if ($nl.Contains($nameLower) -or $nameLower.Contains($nl)) { $foundPartial = $true }
-        }
-    }
-    $installSignal = if ($foundExact) { -30 } elseif ($foundPartial) { -10 } else { 0 }
-    $pathScore = if ($PathSuffix -match 'ProgramData') { 5 } elseif ($PathSuffix -match 'Local') { 3 } else { 0 }
-    $total = [Math]::Max(0, $staleness + $sizeScore + $installSignal + $pathScore)
-    $level = if ($total -le 15) { 'Low' } elseif ($total -le 40) { 'Medium' } else { 'High' }
-    $color = if ($total -le 15) { 'Green' } elseif ($total -le 40) { 'Yellow' } else { 'Red' }
-    return [PSCustomObject]@{ Score = $total; RiskLevel = $level; Color = $color; Staleness = $staleness; SizeScore = $sizeScore; InstallSig = $installSignal; PathTrust = $pathScore }
 }
 
 function Get-HealthScore {
@@ -593,8 +447,20 @@ function Get-HealthScore {
     }
     $browserScore = if ($oldestCacheDays -lt 7) { 20 } elseif ($oldestCacheDays -lt 30) { 14 } elseif ($oldestCacheDays -lt 90) { 8 } else { 0 }
     
+    # Orphan risk is scored from the last scan report; with no scan there is no
+    # evidence either way, so the component keeps its full 25 points.
     $orphanScore = 25
-    $orphanInfo = $script:LastOrphanRisks
+    $orphanInfo = $null
+    if (Get-Command Get-OrphanScanReport -ErrorAction SilentlyContinue) {
+        $scanReport = Get-OrphanScanReport -ErrorAction SilentlyContinue
+        if ($scanReport -and $scanReport.Findings) {
+            $scanFindings = @($scanReport.Findings)
+            $orphanInfo = [PSCustomObject]@{
+                HighCount = @($scanFindings | Where-Object { $_.RiskLevel -eq 'High' }).Count
+                MedCount  = @($scanFindings | Where-Object { $_.RiskLevel -eq 'Medium' }).Count
+            }
+        }
+    }
     if ($orphanInfo) {
         $orphanScore = if ($orphanInfo.HighCount -eq 0 -and $orphanInfo.MedCount -lt 3) { 25 }
                     elseif ($orphanInfo.HighCount -le 2 -or $orphanInfo.MedCount -le 5) { 15 }
@@ -621,23 +487,6 @@ function Get-HealthScore {
     }
     $script:HealthCache = @{ Fast = [bool]$Fast; Data = $result; Expires = $now.AddSeconds(30) }
     return $result
-}
-
-function Get-AppLogoLines {
-    [CmdletBinding()]
-    param()
-    @(
-        ' .------------------------------------------------------------. '
-        ' |   ____        _           _                                | '
-        ' |  | _ \      | |         | |                               | '
-        ' |  | |_) | __ _| | ____ _  | |__   __ _ _ __  _   _ ___      | '
-        ' |  |  _ < / _` | |/ / _` | | `_ \ / _` | `_ \| | | / __|     | '
-        ' |  | |_) | (_| |   < (_| | | |_) | (_| | |_) | |_| \__ \     | '
-        ' |  |____/ \__,_|_|\_\__,_| |_.__/ \__,_| .__/ \__,_|___/     | '
-        ' |                                       | |                  | '
-        ' |    B A K U N A W A   v3              |_|   Devour Waste    | '
-        ' `------------------------------------------------------------` '
-    )
 }
 
 function Get-ConsoleWidth {
@@ -675,26 +524,12 @@ function Format-CompactList {
     return $shown -join ', '
 }
 
-function New-AsciiBar {
-    [CmdletBinding()]
-    param([int]$Value,[int]$Total,[int]$Width=18)
-    if ($Width -lt 1) { $Width = 1 }
-    $safeValue = [Math]::Max(0, $Value)
-    $safeTotal = [Math]::Max(0, $Total)
-    if ($safeTotal -le 0) { return ('[{0}] 0%' -f ('.' * $Width)) }
-    if ($safeValue -gt $safeTotal) { $safeValue = $safeTotal }
-    $filled = [Math]::Min($Width, [int][Math]::Round(($safeValue / [double]$safeTotal) * $Width))
-    $empty  = [Math]::Max(0, $Width - $filled)
-    $pct    = [int][Math]::Round(($safeValue / [double]$safeTotal) * 100)
-    return ('[{0}{1}] {2}%' -f ('#' * $filled), ('.' * $empty), $pct)
-}
-
 function Get-SystemLocations {
     [CmdletBinding()]
     $wr = Get-EnvPath 'SystemRoot'
     $pd = Get-EnvPath 'ProgramData'
     $sd = Get-EnvPath 'SystemDrive'
-    $script:SysLoc = [PSCustomObject]@{
+    $sysLoc = [PSCustomObject]@{
         WindowsRoot  = $wr
         ProgramData  = $pd
         SystemDrive  = $sd
@@ -707,7 +542,7 @@ function Get-SystemLocations {
         DeliveryOpt  = $(if($wr){Join-Path $wr 'SoftwareDistribution\DeliveryOptimization'})
         RecycleBin   = $(if($sd){Join-Path $sd '$Recycle.Bin'})
     }
-    return $script:SysLoc
+    return $sysLoc
 }
 
 function Get-LocationOptions {
@@ -889,4 +724,4 @@ function Get-AppDefinitions {
     }
 }
 
-Export-ModuleMember -Function Get-ProtectedKnownFolders, Get-CoreSkippedItems, Get-CoreExcludedPaths, Get-FreeSpaceInfo, Get-DirectorySize, Get-DirectorySizeEstimate, Format-FileSize, New-TrackedSet, Resolve-FullPath, Resolve-RealPath, Get-EnvPath, Join-EnvPath, Test-IsAdministrator, Restart-Elevated, Get-ExcludedPaths, Test-IsExcludedPath, Get-DefaultApprovedRoots, Test-SafeCleanupTarget, Get-DisposableDirectoryNames, Test-IsDisposableLogPath, Get-DisposableLogCandidates, Get-StaleDisposableDirectories, Get-JunkSweepRoots, Get-InstalledApplicationNames, Get-RunningProcessNames, Test-AnyProcessRunning, Register-SkippedItem, Get-OrphanRiskScore, Get-HealthScore, Get-AllAppDefinitions, Get-AppDefinitions, Get-SystemLocations, Get-AppLogoLines, Get-ConsoleWidth, Get-DisplayText, Get-PathLabel, Format-CompactList, New-AsciiBar, Initialize-CoreSafetyState
+Export-ModuleMember -Function Get-ProtectedKnownFolders, Get-CoreSkippedItems, Get-CoreExcludedPaths, Get-FreeSpaceInfo, Get-DirectorySize, Get-DirectorySizeEstimate, Format-FileSize, New-TrackedSet, Resolve-FullPath, Resolve-RealPath, Get-EnvPath, Join-EnvPath, Test-IsAdministrator, Restart-Elevated, Get-ExcludedPaths, Test-IsExcludedPath, Get-DisposableDirectoryNames, Get-InstalledApplicationNames, Get-RunningProcessNames, Test-AnyProcessRunning, Register-SkippedItem, Get-HealthScore, Get-AllAppDefinitions, Get-AppDefinitions, Get-SystemLocations, Get-ConsoleWidth, Get-DisplayText, Get-PathLabel, Format-CompactList, Initialize-CoreSafetyState

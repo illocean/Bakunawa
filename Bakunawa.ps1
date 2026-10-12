@@ -21,19 +21,10 @@ param(
 Set-Variable -Name ErrorActionPreference -Value 'Continue' -Scope Script
 [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
 
-# Animation frames
-$script:SpinnerFrames = @('|','/','-','\')
-$script:SpinnerIndex = 0
-$script:WaveFrames = @('1','2','3','4','5','6','7','8')
-$script:WaveIndex = 0
-$script:PulseFrames = @('o','O','@','*')
-$script:PulseIndex = 0
-
 # Import modules from src/
 $moduleDir = Join-Path $PSScriptRoot 'src'
 Import-Module (Join-Path $moduleDir 'Bakunawa.Core.psm1') -Force -Scope Global -ErrorAction Stop -WarningAction SilentlyContinue
 Import-Module (Join-Path $moduleDir 'Bakunawa.Config.psm1') -Force -Scope Global -ErrorAction Stop -WarningAction SilentlyContinue
-Import-Module (Join-Path $moduleDir 'Bakunawa.Runspace.psm1') -Force -Scope Global -ErrorAction Stop -WarningAction SilentlyContinue
 Import-Module (Join-Path $moduleDir 'Bakunawa.Cleanup.psm1') -Force -Scope Global -ErrorAction Stop -WarningAction SilentlyContinue
 Import-Module (Join-Path $moduleDir 'Bakunawa.UI.psm1') -Force -Scope Global -ErrorAction Stop -WarningAction SilentlyContinue
 
@@ -58,13 +49,29 @@ function Test-LegacyConsole {
     return ($parent.Name -eq 'conhost.exe')
 }
 
+function Get-ElevationShell {
+    # pwsh preferred when installed; Windows PowerShell 5.1 is the always-present fallback.
+    $pwsh = Get-Command pwsh.exe -ErrorAction Ignore
+    if ($pwsh) { return $pwsh.Source }
+    $winPs = Get-Command powershell.exe -ErrorAction Ignore
+    if ($winPs) { return $winPs.Source }
+    return $null
+}
+
 function Restart-ModernTerminal {
     param([string]$SelectedMode)
+    # One modern-relaunch attempt per process: a failed or cancelled UAC prompt
+    # must not queue a second one from the Restart-Elevated fallback below.
+    if ($script:ModernLaunchTried) { return $false }
     $wt = Get-Command wt.exe -ErrorAction SilentlyContinue
-    if (-not $wt) {
-        Write-Host 'Windows Terminal (wt.exe) not found. Falling back to standard elevation.' -ForegroundColor Yellow
-        return (Restart-Elevated -SelectedMode $SelectedMode)
+    $shell = Get-ElevationShell
+    if (-not $wt -or -not $shell) {
+        Write-Host 'Windows Terminal (wt.exe) not available for relaunch.' -ForegroundColor Yellow
+        return $false
     }
+    # Use the WindowsApps execution alias ($wt.Source), never the packaged binary
+    # under C:\Program Files\WindowsApps: launching that payload directly starts
+    # no terminal and no child, so elevation would silently do nothing.
     $entry = if ($PSCommandPath) { $PSCommandPath } else { Join-Path $PSScriptRoot 'Bakunawa.ps1' }
     # ForceAdmin breaks the relaunch loop: the child is already elevated by -Verb RunAs,
     # so it must not try to detect the console or elevate again.
@@ -77,30 +84,42 @@ function Restart-ModernTerminal {
         if ($value) { $forward[$name] = $value }
     }
     $data = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes([Management.Automation.PSSerializer]::Serialize($forward)))
-    $body = '$forward = [Management.Automation.PSSerializer]::Deserialize([Text.Encoding]::UTF8.GetString([Convert]::FromBase64String(''{0}''))); & ''{1}'' @forward' -f $data, $entry.Replace("'", "''")
+    # The child acknowledges the launch by creating $ack. wt.exe is a GUI app and
+    # can die without an exception, which would leave the user staring at a
+    # vanished console with no fallback triggered.
+    $ack = Join-Path ([IO.Path]::GetTempPath()) ('bakunawa-elevated-{0}.txt' -f $PID)
+    $body = '$ack = ''{0}''; try {{ Set-Content -LiteralPath $ack -Value ''ok'' -ErrorAction Stop }} catch {{}}; $forward = [Management.Automation.PSSerializer]::Deserialize([Text.Encoding]::UTF8.GetString([Convert]::FromBase64String(''{1}''))); & ''{2}'' @forward' -f $ack.Replace("'", "''"), $data, $entry.Replace("'", "''")
     $encoded = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($body))
     $cmd = "-NoProfile -ExecutionPolicy Bypass -EncodedCommand $encoded"
+    $script:ModernLaunchTried = $true
     Write-Host ''
     Write-Host 'Relaunching in Windows Terminal as Administrator...' -ForegroundColor Cyan
+    $launched = $false
     try {
-        Start-Process -FilePath $wt.Source -ArgumentList '-d', (Split-Path -Parent $entry), 'pwsh.exe', $cmd -Verb RunAs | Out-Null
-        return $true
+        # Quote the directory and shell paths: user profile paths can contain spaces.
+        Start-Process -FilePath $wt.Source -ArgumentList '-d', ('"{0}"' -f (Split-Path -Parent $entry)), ('"{0}"' -f $shell), $cmd -Verb RunAs | Out-Null
+        $launched = $true
     } catch {
-        Write-Host "Windows Terminal launch failed: $($_.Exception.Message)" -ForegroundColor Red
-        Write-Host 'Falling back to standard elevation.' -ForegroundColor Yellow
-        return (Restart-Elevated -SelectedMode $SelectedMode)
+        Write-Host "Windows Terminal launch failed: $($_.Exception.Message)" -ForegroundColor Yellow
     }
+    if ($launched) {
+        for ($i = 0; $i -lt 20 -and -not (Test-Path -LiteralPath $ack); $i++) { Start-Sleep -Milliseconds 300 }
+        if (Test-Path -LiteralPath $ack) {
+            Remove-Item -LiteralPath $ack -Force -ErrorAction SilentlyContinue
+            return $true
+        }
+        Write-Host 'Windows Terminal did not take over the session.' -ForegroundColor Yellow
+    }
+    Remove-Item -LiteralPath $ack -Force -ErrorAction SilentlyContinue
+    return $false
 }
 
 function Restart-Elevated {
     param([string]$SelectedMode)
-    $hostExe = $null
-    $pwsh = Get-Command pwsh.exe -ErrorAction Ignore
-    if ($pwsh) { $hostExe = $pwsh.Source }
-    else {
-        $winPs = Get-Command powershell.exe -ErrorAction Ignore
-        if ($winPs) { $hostExe = $winPs.Source }
-    }
+    # Elevate into Windows Terminal when it is installed; the bare
+    # powershell.exe window below is only the fallback for machines without wt.exe.
+    if (Restart-ModernTerminal -SelectedMode $SelectedMode) { return $true }
+    $hostExe = Get-ElevationShell
     if (-not $hostExe) {
         Write-Host 'PowerShell executable not found. Elevation requires powershell.exe or pwsh.exe.' -ForegroundColor Red
         return $false
@@ -206,7 +225,7 @@ if (-not $SkipBootstrap) {
     if ($config.extraExcludePaths) { $extraExclusions += $config.extraExcludePaths }
     if ($script:ExtraExcludePaths) { $extraExclusions += $script:ExtraExcludePaths }
 
-    Initialize-CleanupState -Config $config -ScanRoot $ScanRoot -ExtraExcludePath $extraExclusions -VerboseScan:$VerboseScan -Aggressive:($Mode -eq 'Aggressive')
+    Initialize-CleanupState -Config $config -ScanRoot $ScanRoot -ExtraExcludePath $extraExclusions -VerboseScan:$VerboseScan -Aggressive:($Mode -eq 'Aggressive') -ModeName $Mode
     Set-UiContext -Mode $Mode
     Set-UiOptions -NoAnimations:$NoAnimations
 
@@ -268,21 +287,21 @@ if (-not $SkipBootstrap) {
             $totalMs = [math]::Round($totalSb.Elapsed.TotalMilliseconds, 2)
             
             Write-Host ''
-            Write-ReportHeading 'BENCHMARK SUMMARY'
-            Write-ReportMetric 'Elapsed' (Format-ReportDuration $totalSb.Elapsed.TotalSeconds)
-            Write-ReportMetric 'Total milliseconds' ([string]$totalMs)
-            Write-ReportMetric 'Categories measured' ([string]$tasks.Count)
-            Write-ReportMetric 'Recorded errors' ([string]@(Get-CleanupErrorLog).Count)
-            Write-ReviewLine 'Category estimates do not establish complete filesystem coverage.'
-            Write-ReviewLine 'Slowest categories:'
+            Write-ReportTitle 'Benchmark summary' -Meta (Format-ReportDuration $totalSb.Elapsed.TotalSeconds)
+            Write-ReportRow ('Total milliseconds  {0}' -f $totalMs)
+            Write-ReportRow ('Categories measured  {0}' -f $tasks.Count)
+            Write-ReportRow ('Recorded errors  {0}' -f @(Get-CleanupErrorLog).Count)
+            Write-ReportRow 'Category estimates do not establish complete filesystem coverage.' -Color DarkGray
+            Write-ReportRow 'Slowest categories:' -Color DarkGray
             
             # Show top 5 slowest categories
             $sorted = $categoryTimes.GetEnumerator() | Sort-Object Value -Descending | Select-Object -First 5
             foreach ($entry in $sorted) {
-                Write-Log "  $($entry.Key): $($entry.Value)ms" 'SIZE'
+                Write-ReportRow ('{0}{1,8} ms' -f ('    ' + $entry.Key), $entry.Value) -Color DarkGray
+                Write-ScanLogText ("{0}: {1}ms" -f $entry.Key, $entry.Value)
             }
             
-            Write-ReviewLine 'Timing depends on data size, access, and cached results. No files were deleted.'
+            Write-ReportRow 'Timing depends on data size, access, and cached results. No files were deleted.' -Color DarkGray
             
             Write-Host ''
         }

@@ -212,15 +212,6 @@
     ]
   },
   {
-    "name": "JetBrains",
-    "process": null,
-    "category": "Dev Caches",
-    "locations": [
-      { "env": "LOCALAPPDATA", "path": "JetBrains/{product}" },
-      { "env": "APPDATA", "path": "JetBrains/{product}" }
-    ]
-  },
-  {
     "name": "IntelliJ IDEA",
     "process": "idea64",
     "category": "Dev Caches",

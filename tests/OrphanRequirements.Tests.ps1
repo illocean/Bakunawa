@@ -293,7 +293,7 @@ Describe 'Orphan evidence, protected paths and common cleanup planning' {
         $run.CategoryReport[0].ActedBytes | Should -BeNullOrEmpty
         $run.CategoryReport[0].NotActedBytes | Should -BeNullOrEmpty
         $text = Show-CleanupResult $run 6>&1 | Out-String
-        $text | Should -Match 'acted on unknown'
+        $text | Should -Match 'unknown acted on'
         $text | Should -Match 'lower bounds'
     }
 
@@ -332,8 +332,15 @@ Describe 'Entry precedence and source encoding' {
         Should -Invoke Invoke-CleanupRun -Times 1 -Exactly -ParameterFilter { $Mode -eq 'Aggressive' }
         Should -Invoke Initialize-CleanupState -Times 1 -Exactly -ParameterFilter { $Aggressive }
     }
-    It 'uses the same task categories for Standard and Aggressive' {
-        (@(Get-CleanupTasks Standard).Name -join '|') | Should -Be (@(Get-CleanupTasks Aggressive).Name -join '|')
+    It 'uses the same task categories for Standard and Aggressive, plus aggressive extras' {
+        $standard = @(Get-CleanupTasks Standard | ForEach-Object { $_.Name })
+        $aggressive = @(Get-CleanupTasks Aggressive | ForEach-Object { $_.Name })
+        # Every Standard task must remain in Aggressive (regression: extras must not
+        # replace the routine set), and the extras are additive.
+        foreach ($name in $standard) {
+            $aggressive | Should -Contain $name
+        }
+        @($aggressive | Where-Object { $_ -notin $standard }) | Should -Be @('Prefetch', 'DISM', 'Event Logs + Font Cache')
     }
     It 'runs ReportPath twice through the entry point and preserves the first report' {
         Mock Find-OrphanFolders { @() }
