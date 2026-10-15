@@ -110,8 +110,15 @@ function Resolve-RealPath {
 function Get-EnvPath {
     [CmdletBinding()]
     param([Parameter(Mandatory)][string]$Name)
+    # COMMONPROGRAMFILES resolves to the 64-bit Common Files even from a 32-bit
+    # process on 64-bit Windows, so the 32-bit variant needs an explicit alias:
+    # Google Updater caches under the x86 tree.
+    if ($Name -eq 'COMMONPROGRAMFILES86') { $Name = 'CommonProgramFiles(x86)' }
     foreach ($s in 'Process','User','Machine') {
         $v = [Environment]::GetEnvironmentVariable($Name, $s)
+        # GetFullPath('C:') returns the process CWD on that drive; a bare drive
+        # root is its own path, so anchor it before resolving.
+        if ($v -match '^[A-Za-z]:$') { $v = "$v\" }
         $r = Resolve-FullPath $v
         if ($r) { return $r }
     }
@@ -540,6 +547,7 @@ function Get-SystemLocations {
         SoftDistDL   = $(if($wr){Join-Path $wr 'SoftwareDistribution\Download'})
         Prefetch     = $(if($wr){Join-Path $wr 'Prefetch'})
         DeliveryOpt  = $(if($wr){Join-Path $wr 'SoftwareDistribution\DeliveryOptimization'})
+        LiveKernel   = $(if($wr){Join-Path $wr 'LiveKernelReports'})
         RecycleBin   = $(if($sd){Join-Path $sd '$Recycle.Bin'})
     }
     return $sysLoc
@@ -631,7 +639,10 @@ function Get-AllAppDefinitions {
                 foreach ($loc in $app.locations) {
                     if (-not $loc.env -or $null -eq $loc.path) { continue }
 
-                    $envValue = [Environment]::GetEnvironmentVariable([string]$loc.env, 'Process')
+                    # Get-EnvPath, not the raw environment call: it resolves the
+                    # COMMONPROGRAMFILES86 alias to CommonProgramFiles(x86), whose
+                    # literal name cannot be indexed as a normal env variable.
+                    $envValue = Get-EnvPath ([string]$loc.env)
                     if (-not $envValue) { continue }
 
                     $fullPath = Join-Path $envValue ([string]$loc.path)
@@ -698,7 +709,10 @@ function Get-AppDefinitions {
             foreach ($loc in $app.locations) {
                 if (-not $loc.env -or $null -eq $loc.path) { continue }
 
-                $envValue = [Environment]::GetEnvironmentVariable([string]$loc.env, 'Process')
+                # Get-EnvPath, not the raw environment call: it resolves the
+                # COMMONPROGRAMFILES86 alias to CommonProgramFiles(x86), whose
+                # literal name cannot be indexed as a normal env variable.
+                $envValue = Get-EnvPath ([string]$loc.env)
                 if (-not $envValue) { continue }
 
                 $fullPath = Join-Path $envValue ([string]$loc.path)

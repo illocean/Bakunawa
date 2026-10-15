@@ -54,7 +54,8 @@
       { "env": "APPDATA", "path": "Microsoft/Teams/GPUCache" },
       { "env": "APPDATA", "path": "Microsoft/Teams/logs" },
       { "env": "APPDATA", "path": "Microsoft/Teams/blob_storage" },
-      { "env": "LOCALAPPDATA", "path": "Microsoft/Teams/old_weblogs" }
+      { "env": "LOCALAPPDATA", "path": "Microsoft/Teams/old_weblogs" },
+      { "env": "LOCALAPPDATA", "path": "Microsoft/MSTeams/EBWebView/WV2Profile_tfl/Service Worker/CacheStorage" }
     ]
   },
   {

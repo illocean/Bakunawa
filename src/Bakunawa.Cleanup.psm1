@@ -281,6 +281,61 @@ function Get-CleanupErrorLog {
     if ($script:Errors) { return @($script:Errors) }
 }
 
+# Private helper: measure one entry-mode definition (container whose matching
+# children are themselves the disposable artifact). Returns 0 for definitions
+# whose location is absent or non-entry, so a contents-mode definition keeps
+# falling through to the Measure-AndClear branch.
+function Measure-EntryDefinition {
+    [CmdletBinding()]
+    param([Parameter(Mandatory)][object]$App)
+    if ($App.Mode -ne 'entry' -or -not $App.EntryPatterns) { return 0 }
+    $ageDays = Get-TransientAgeDays -Override $App.MinAgeDays
+    $bytes = 0L
+    foreach ($dir in @(Expand-WildcardPath -Path $App.Path -DirectoriesOnly)) {
+        if (-not $dir -or -not (Test-Path -LiteralPath $dir -PathType Container)) { continue }
+        foreach ($match in @(Get-TransientEntryMatches -Directory $dir -Patterns @($App.EntryPatterns) -EntryType $App.EntryType -MinAgeDays $ageDays)) {
+            if ($match.Reason -or $null -eq $match.Bytes) { continue }
+            $bytes += [long]$match.Bytes
+        }
+    }
+    return [long]$bytes
+}
+
+# Private helper: clear one entry-mode definition. 0 when the definition is not
+# entry-mode, so contents-mode definitions keep their existing behaviour.
+function Clear-EntryDefinition {
+    [CmdletBinding()]
+    param([Parameter(Mandatory)][object]$App, [string]$Category)
+    if ($App.Mode -ne 'entry' -or -not $App.EntryPatterns) { return 0 }
+    $ageDays = Get-TransientAgeDays -Override $App.MinAgeDays
+    $cleared = 0
+    foreach ($dir in @(Expand-WildcardPath -Path $App.Path -DirectoriesOnly)) {
+        if (-not $dir -or -not (Test-Path -LiteralPath $dir -PathType Container)) { continue }
+        # Get-TransientEntryMatches enforces the exclusion list, IsAllowedPath, the
+        # age cutoff and busy-cache checks; Clear-TransientEntries deletes via
+        # Remove-ItemSafely, which honours $script:IsPreview.
+        $cleared += Clear-TransientEntries -Directory $dir -Patterns @($App.EntryPatterns) `
+            -EntryType $App.EntryType -MinAgeDays $ageDays -Category $Category
+    }
+    return $cleared
+}
+
+# Private helper: resolve an app-definition path through the same placeholder
+# expansion the clear functions use, so preview and execution agree on one path.
+function Expand-AppDefinitionPath {
+    [CmdletBinding()]
+    param([Parameter(Mandatory)][AllowEmptyString()][string]$Path)
+    if ([string]::IsNullOrWhiteSpace($Path)) { return $Path }
+    $expandedPath = $Path -replace '\{username\}',$env:USERNAME
+    $expandedPath = $expandedPath -replace '\{appdata\}', $env:APPDATA
+    $expandedPath = $expandedPath -replace '\{localappdata\}', $env:LOCALAPPDATA
+    $expandedPath = $expandedPath -replace '\{programdata\}', $env:PROGRAMDATA
+    $expandedPath = $expandedPath -replace '\{commonprogramfiles\}', $env:COMMONPROGRAMFILES
+    $expandedPath = $expandedPath -replace '\{systemdrive\}', $env:SYSTEMDRIVE
+    $expandedPath = $expandedPath -replace '\{windows\}', $env:WINDIR
+    return $expandedPath
+}
+
 function Measure-AndClear {
     [CmdletBinding()]
     param([AllowEmptyString()][string]$Path, [switch]$EnsureDirectory, [AllowEmptyString()][string]$Category)
@@ -381,15 +436,37 @@ function Get-CleanupPotential {
     $tasks = Get-CleanupTasks -Mode $Mode
     if ($TaskName) { $tasks = @($tasks | Where-Object { $_.Name -eq $TaskName }) }
     foreach ($task in $tasks) {
-        $taskName = $task.Name
+        # $currentTask, never $taskName: reassigning the typed [string]$TaskName
+        # parameter to $task.Name makes PowerShell re-validate it on the next
+        # loop iteration and throw ParameterArgumentTransformationError.
+        $currentTask = $task.Name
         $status = 'ok'
         $bytes = 0L
         $count = 0
-        switch ($taskName) {
+        switch ($currentTask) {
             'System Caches' {
                 foreach ($t in @((Get-EnvPath 'TEMP'), (Join-EnvPath 'LOCALAPPDATA' 'Temp'), $script:SysLoc.WindowsTemp)) {
                     if ($t -and (Test-Path -LiteralPath $t -PathType Container)) {
                         $bytes += Get-DirectorySize $t
+                        $count++
+                    }
+                }
+                # Report* directories and *.dmp dumps are disposable individually, so
+                # measuring the WER/LiveKernel containers themselves would report live
+                # diagnostic data. .dmp files are crash artifacts, not diagnostics in
+                # use, so they age out after 2 days rather than the scan default.
+                $datedSpecs = @(
+                    @{ Dir = $script:SysLoc.WerArchive;     Patterns = @('Report*'); Type = 'directory'; MinAgeDays = 0 },
+                    @{ Dir = $script:SysLoc.WerQueue;       Patterns = @('Report*'); Type = 'directory'; MinAgeDays = 0 },
+                    @{ Dir = $script:SysLoc.LiveKernel;     Patterns = @('*.dmp');   Type = 'file';       MinAgeDays = 2 }
+                )
+                foreach ($spec in $datedSpecs) {
+                    $dir = $spec.Dir
+                    if (-not $dir -or -not (Test-Path -LiteralPath $dir -PathType Container)) { continue }
+                    $ageDays = if ($spec.MinAgeDays -gt 0) { Get-TransientAgeDays -Override $spec.MinAgeDays } else { Get-TransientAgeDays }
+                    foreach ($match in @(Get-TransientEntryMatches -Directory $dir -Patterns $spec.Patterns -EntryType $spec.Type -MinAgeDays $ageDays)) {
+                        if ($match.Reason -or $null -eq $match.Bytes) { continue }
+                        $bytes += [long]$match.Bytes
                         $count++
                     }
                 }
@@ -417,18 +494,22 @@ function Get-CleanupPotential {
                 $applist = Get-AllAppDefinitions -Category 'App Caches'
                 foreach ($app in $applist) {
                     if (-not $app.Name) { continue }
-                    $expandedPath = $app.Path -replace '{username}',$env:USERNAME
-                    $expandedPath = $expandedPath -replace '{appdata}', $env:APPDATA
-                    $expandedPath = $expandedPath -replace '{localappdata}', $env:LOCALAPPDATA
-                    $expandedPath = $expandedPath -replace '{programdata}', $env:PROGRAMDATA
-                    $expandedPath = $expandedPath -replace '{commonprogramfiles}', $env:COMMONPROGRAMFILES
-                    $expandedPath = $expandedPath -replace '{systemdrive}', $env:SYSTEMDRIVE
-                    $expandedPath = $expandedPath -replace '{windows}', $env:WINDIR
-                    foreach ($resolved in @(Expand-WildcardPath -Path $expandedPath -DirectoriesOnly)) {
-                        if (Test-Path -LiteralPath $resolved -PathType Container) {
-                            $bytes += Get-DirectorySize $resolved
-                            $count++
+                    $expandedPath = Expand-AppDefinitionPath -Path $app.Path
+                    if ($app.Mode -eq 'entry') {
+                        if (-not $app.EntryPatterns) { continue }
+                        $ageDays = Get-TransientAgeDays -Override $app.MinAgeDays
+                        foreach ($dir in @(Expand-WildcardPath -Path $expandedPath -DirectoriesOnly)) {
+                            if (-not $dir -or -not (Test-Path -LiteralPath $dir -PathType Container)) { continue }
+                            foreach ($match in @(Get-TransientEntryMatches -Directory $dir -Patterns @($app.EntryPatterns) -EntryType $app.EntryType -MinAgeDays $ageDays)) {
+                                if ($match.Reason -or $null -eq $match.Bytes) { continue }
+                                $bytes += [long]$match.Bytes
+                                $count++
+                            }
                         }
+                        continue
+                    }
+                    foreach ($resolvedPath in @(Expand-WildcardPath -Path $expandedPath -DirectoriesOnly)) {
+                        if ($resolvedPath) { $bytes += Get-DirectorySize $resolvedPath; $count++ }
                     }
                 }
             }
@@ -437,6 +518,19 @@ function Get-CleanupPotential {
                 # so measuring whole directories over-reported this category badly.
                 foreach ($app in @(Get-AllAppDefinitions -Category 'AI Agent Caches')) {
                     if (-not $app.Path) { continue }
+                    if ($app.Mode -eq 'entry') {
+                        if (-not $app.EntryPatterns) { continue }
+                        $ageDays = Get-TransientAgeDays -Override $app.MinAgeDays
+                        foreach ($d in @(Expand-WildcardPath -Path $app.Path -DirectoriesOnly)) {
+                            if (-not $d -or -not (Test-Path -LiteralPath $d -PathType Container)) { continue }
+                            foreach ($match in @(Get-TransientEntryMatches -Directory $d -Patterns @($app.EntryPatterns) -EntryType $app.EntryType -MinAgeDays $ageDays)) {
+                                if ($match.Reason -or $null -eq $match.Bytes) { continue }
+                                $bytes += [long]$match.Bytes
+                                $count++
+                            }
+                        }
+                        continue
+                    }
                     $ageDays = if ($app.MinAgeDays -gt 0) { $app.MinAgeDays } else { 3 }
                     foreach ($d in @(Expand-WildcardPath -Path $app.Path -DirectoriesOnly)) {
                         if (-not $d -or -not (Test-Path -LiteralPath $d -PathType Container)) { continue }
@@ -476,10 +570,13 @@ function Get-CleanupPotential {
                         if ($app.Mode -eq 'entry') {
                             if (-not $app.EntryPatterns) { continue }
                             $ageDays = Get-TransientAgeDays -Override $app.MinAgeDays
-                            foreach ($match in @(Get-TransientEntryMatches -Directory $expandedPath -Patterns @($app.EntryPatterns) -EntryType $app.EntryType -MinAgeDays $ageDays)) {
-                                if ($match.Reason -or $null -eq $match.Bytes) { continue }
-                                $bytes += [long]$match.Bytes
-                                $count++
+                            foreach ($dir in @(Expand-WildcardPath -Path $expandedPath -DirectoriesOnly)) {
+                                if (-not $dir -or -not (Test-Path -LiteralPath $dir -PathType Container)) { continue }
+                                foreach ($match in @(Get-TransientEntryMatches -Directory $dir -Patterns @($app.EntryPatterns) -EntryType $app.EntryType -MinAgeDays $ageDays)) {
+                                    if ($match.Reason -or $null -eq $match.Bytes) { continue }
+                                    $bytes += [long]$match.Bytes
+                                    $count++
+                                }
                             }
                             continue
                         }
@@ -541,7 +638,7 @@ function Get-CleanupPotential {
                 }
             }
             { $_ -in @('Game Caches','Browser Automation Caches') } {
-                foreach ($app in @(Get-AllAppDefinitions -Category $taskName)) {
+                foreach ($app in @(Get-AllAppDefinitions -Category $currentTask)) {
                     foreach ($path in @(Expand-WildcardPath -Path $app.Path -DirectoriesOnly)) {
                         if (Test-Path -LiteralPath $path -PathType Container) {
                             $bytes += Get-DirectorySize $path
@@ -675,7 +772,20 @@ function Get-CleanupPotential {
             'Productivity' {
                 $applist = Get-AllAppDefinitions -Category 'Productivity'
                 foreach ($app in $applist) {
-                    $expandedPath = $app.Path -replace '{username}',$env:USERNAME -replace '{appdata}', $env:APPDATA -replace '{localappdata}', $env:LOCALAPPDATA
+                    $expandedPath = Expand-AppDefinitionPath -Path $app.Path
+                    if ($app.Mode -eq 'entry') {
+                        if (-not $app.EntryPatterns) { continue }
+                        $ageDays = Get-TransientAgeDays -Override $app.MinAgeDays
+                        foreach ($dir in @(Expand-WildcardPath -Path $expandedPath -DirectoriesOnly)) {
+                            if (-not $dir -or -not (Test-Path -LiteralPath $dir -PathType Container)) { continue }
+                            foreach ($match in @(Get-TransientEntryMatches -Directory $dir -Patterns @($app.EntryPatterns) -EntryType $app.EntryType -MinAgeDays $ageDays)) {
+                                if ($match.Reason -or $null -eq $match.Bytes) { continue }
+                                $bytes += [long]$match.Bytes
+                                $count++
+                            }
+                        }
+                        continue
+                    }
                     foreach ($resolved in @(Expand-WildcardPath -Path $expandedPath -DirectoriesOnly)) {
                         if (Test-Path -LiteralPath $resolved -PathType Container) {
                             $bytes += Get-DirectorySize $resolved
@@ -701,8 +811,8 @@ function Get-CleanupPotential {
             }
         }
         [void]$results.Add([PSCustomObject]@{
-            Task = $taskName
-            Target = $taskName
+            Task = $currentTask
+            Target = $currentTask
             EstimatedBytes = $bytes
             FileCount = $count
             Status = $status
@@ -793,6 +903,18 @@ function Clear-SystemCaches {
     }
     if ($script:SysLoc.SoftDistDL -and (Measure-AndClear $script:SysLoc.SoftDistDL -EnsureDirectory -Category $cat)) { $n++ }
     if ($script:SysLoc.DeliveryOpt -and (Measure-AndClear $script:SysLoc.DeliveryOpt -EnsureDirectory -Category $cat)) { $n++ }
+    # Dated crash artifacts: entry mode, so only the entries old enough to be stale
+    # are removed and the containers themselves survive.
+    foreach ($wer in @($script:SysLoc.WerArchive, $script:SysLoc.WerQueue)) {
+        if (-not $wer -or -not (Test-Path -LiteralPath $wer -PathType Container)) { continue }
+        $n += Clear-TransientEntries -Directory $wer -Patterns @('Report*') `
+            -EntryType 'directory' -MinAgeDays (Get-TransientAgeDays) -Category $cat
+    }
+    if ($script:SysLoc.LiveKernel -and (Test-Path -LiteralPath $script:SysLoc.LiveKernel -PathType Container)) {
+        # Crash dumps are artifacts, not diagnostics in use: 2 days, not the scan default.
+        $n += Clear-TransientEntries -Directory $script:SysLoc.LiveKernel -Patterns @('*.dmp') `
+            -EntryType 'file' -MinAgeDays (Get-TransientAgeDays -Override 2) -Category $cat
+    }
     $n
 }
 
@@ -870,6 +992,10 @@ function Clear-AppCaches {
             $expandedPath = $expandedPath -replace '\{windows\}', $env:WINDIR
 
             $appsubcat = "$($app.Name) - $($app.Category)"
+            if ($app.Mode -eq 'entry') {
+                $n += Clear-EntryDefinition -App $app -Category $appsubcat
+                continue
+            }
             foreach ($resolvedPath in @(Expand-WildcardPath -Path $expandedPath -DirectoriesOnly)) {
                 if ($resolvedPath) {
                     if (Measure-AndClear $resolvedPath -Category $appsubcat) { $total++ }
@@ -1290,7 +1416,11 @@ function Invoke-CleanupRun {
                  $applist = Get-AllAppDefinitions -Category 'Productivity'
                  foreach ($app in $applist) {
                      if ($app.Path) {
-                         $expandedPath = $app.Path -replace '{username}',$env:USERNAME -replace '{appdata}', $env:APPDATA -replace '{localappdata}', $env:LOCALAPPDATA
+                         $expandedPath = Expand-AppDefinitionPath -Path $app.Path
+                         if ($app.Mode -eq 'entry') {
+                             if ($app.EntryPatterns) { $null = Clear-EntryDefinition -App $app -Category 'Productivity' }
+                             continue
+                         }
                          foreach ($resolved in @(Expand-WildcardPath -Path $expandedPath -DirectoriesOnly)) {
                              if ($resolved) {
                                  Measure-AndClear $resolved -Category 'Productivity' -EA SilentlyContinue | Out-Null
@@ -1587,6 +1717,13 @@ function Clear-AIAgentCaches {
     # Get-AllAppDefinitions already resolves env+path to a full path.
     foreach ($app in @(Get-AllAppDefinitions -Category 'AI Agent Caches')) {
         if (-not $app.Path) { continue }
+        # Entry-mode locations (date-named container children) run through the
+        # shared entry plumbing; contents-mode definitions keep the file-pattern
+        # behaviour unchanged.
+        if ($app.Mode -eq 'entry') {
+            if ($app.EntryPatterns) { $n += Clear-EntryDefinition -App $app -Category $cat }
+            continue
+        }
         # A positive per-definition minAgeDays raises the guardrail for that location;
         # the default stays the documented 3 days.
         $minAgeDays = if ($app.MinAgeDays -gt 0) { $app.MinAgeDays } else { 3 }

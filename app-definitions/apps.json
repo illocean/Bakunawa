@@ -122,5 +122,21 @@
     "locations": [
       { "env": "APPDATA", "path": "Figma/Cache" }
     ]
+  },
+  {
+    "name": "Logi Options+",
+    "process": "LogiOptionsPlus",
+    "category": "App Caches",
+    "locations": [
+      { "env": "PROGRAMDATA", "path": "LogiOptionsPlus/cache", "mode": "entry", "entryType": "file", "entryPatterns": ["*"] }
+    ]
+  },
+  {
+    "name": "Google Updater",
+    "process": "GoogleUpdate",
+    "category": "App Caches",
+    "locations": [
+      { "env": "COMMONPROGRAMFILES86", "path": "Google/GoogleUpdater/crx_cache", "mode": "entry", "entryType": "file", "entryPatterns": ["*"] }
+    ]
   }
 ]

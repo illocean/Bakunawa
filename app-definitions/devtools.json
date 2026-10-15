@@ -392,7 +392,7 @@
     "process": "omniroute",
     "category": "AI Agent Caches",
     "locations": [
-      { "env": "USERPROFILE", "path": ".omniroute/call_logs" },
+      { "env": "USERPROFILE", "path": ".omniroute/call_logs", "mode": "entry", "entryType": "directory", "entryPatterns": ["*"], "minAgeDays": 2 },
       { "env": "USERPROFILE", "path": ".omniroute/logs" },
       { "env": "USERPROFILE", "path": ".omniroute/db_backups" }
     ]

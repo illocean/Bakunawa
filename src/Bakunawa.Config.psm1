@@ -173,7 +173,7 @@ function Get-DefaultConfig {
         scanSettings = @{
             roots = @()
             minAgeDays = 30
-            aggressiveMinAgeDays = 14
+            aggressiveMinAgeDays = 2
         }
         behaviorSettings = @{
             verboseLogging = $false
