@@ -224,6 +224,12 @@ function Get-ExcludedPaths {
     # WinGet packages (user-managed)
     $r = Resolve-RealPath (Join-EnvPath 'LOCALAPPDATA' 'Packages')
     if ($r) { [void]$set.Add($r) }
+
+    # OmniRoute's working source checkout under Temp is live session state, not a
+    # cache: the exclusion keeps the generic temp sweep from taking it with the
+    # surrounding directory.
+    $r = Resolve-RealPath (Join-EnvPath 'LOCALAPPDATA' 'Temp' 'opencode' 'OmniRoute')
+    if ($r) { [void]$set.Add($r) }
     
     # User-provided extra exclusions
     foreach ($c in $ExtraExcludePath) {
@@ -250,6 +256,23 @@ function Test-IsExcludedPath {
     foreach ($e in @(Get-CoreExcludedPaths)) {
         if ($r.Equals($e,[StringComparison]::OrdinalIgnoreCase) -or
             $r.StartsWith("$e\",[StringComparison]::OrdinalIgnoreCase)) { return $true }
+    }
+    return $false
+}
+
+# True when the path is excluded, or when it holds an excluded path. Sweeping a
+# parent must not take a protected child with it, so a directory that contains
+# an exclusion counts as protected too. This is the check the scanner cannot
+# make: it only sees one path at a time.
+function Test-PathProtectedByExclusion {
+    [CmdletBinding()]
+    param([string]$Path)
+    $r = Resolve-RealPath $Path
+    if (-not $r) { return $false }
+    foreach ($e in @(Get-CoreExcludedPaths)) {
+        if ($r.Equals($e,[StringComparison]::OrdinalIgnoreCase) -or
+            $r.StartsWith("$e\",[StringComparison]::OrdinalIgnoreCase) -or
+            $e.StartsWith("$r\",[StringComparison]::OrdinalIgnoreCase)) { return $true }
     }
     return $false
 }
@@ -646,20 +669,34 @@ function Get-AllAppDefinitions {
                     if (-not $envValue) { continue }
 
                     $fullPath = Join-Path $envValue ([string]$loc.path)
+                    # A wildcard in the last segment names an installed build
+                    # (ms-playwright/chromium-<revision>). Resolve it here so callers
+                    # that compare targets see the concrete directory. A pattern whose
+                    # parent is missing stays unresolved and cleanup expands it later.
+                    $paths = @($fullPath)
+                    if ($fullPath -match '[*?]') {
+                        $parent = Split-Path -Parent $fullPath
+                        if ($parent -and (Test-Path -LiteralPath $parent -PathType Container)) {
+                            $paths = @(Get-ChildItem -LiteralPath $parent -Filter (Split-Path -Leaf $fullPath) -Directory -ErrorAction SilentlyContinue |
+                                ForEach-Object { $_.FullName })
+                        }
+                    }
                     $options = Get-LocationOptions -Location $loc
-                    $flattened.Add([PSCustomObject]@{
-                        Name          = [string]$app.name
-                        Path          = $fullPath
-                        Env           = [string]$loc.env
-                        Process       = $app.process
-                        Category      = $appCategory
-                        SourceFile    = $jf.Name
-                        OrphanRule    = $app.orphanRule
-                        Mode          = $options.Mode
-                        EntryPatterns = $options.EntryPatterns
-                        EntryType     = $options.EntryType
-                        MinAgeDays    = $options.MinAgeDays
-                    })
+                    foreach ($path in $paths) {
+                        $flattened.Add([PSCustomObject]@{
+                            Name          = [string]$app.name
+                            Path          = $path
+                            Env           = [string]$loc.env
+                            Process       = $app.process
+                            Category      = $appCategory
+                            SourceFile    = $jf.Name
+                            OrphanRule    = $app.orphanRule
+                            Mode          = $options.Mode
+                            EntryPatterns = $options.EntryPatterns
+                            EntryType     = $options.EntryType
+                            MinAgeDays    = $options.MinAgeDays
+                        })
+                    }
                 }
             }
         } catch {
@@ -738,4 +775,4 @@ function Get-AppDefinitions {
     }
 }
 
-Export-ModuleMember -Function Get-ProtectedKnownFolders, Get-CoreSkippedItems, Get-CoreExcludedPaths, Get-FreeSpaceInfo, Get-DirectorySize, Get-DirectorySizeEstimate, Format-FileSize, New-TrackedSet, Resolve-FullPath, Resolve-RealPath, Get-EnvPath, Join-EnvPath, Test-IsAdministrator, Restart-Elevated, Get-ExcludedPaths, Test-IsExcludedPath, Get-DisposableDirectoryNames, Get-InstalledApplicationNames, Get-RunningProcessNames, Test-AnyProcessRunning, Register-SkippedItem, Get-HealthScore, Get-AllAppDefinitions, Get-AppDefinitions, Get-SystemLocations, Get-ConsoleWidth, Get-DisplayText, Get-PathLabel, Format-CompactList, Initialize-CoreSafetyState
+Export-ModuleMember -Function Get-ProtectedKnownFolders, Get-CoreSkippedItems, Get-CoreExcludedPaths, Get-FreeSpaceInfo, Get-DirectorySize, Get-DirectorySizeEstimate, Format-FileSize, New-TrackedSet, Resolve-FullPath, Resolve-RealPath, Get-EnvPath, Join-EnvPath, Test-IsAdministrator, Restart-Elevated, Get-ExcludedPaths, Test-IsExcludedPath, Test-PathProtectedByExclusion, Get-DisposableDirectoryNames, Get-InstalledApplicationNames, Get-RunningProcessNames, Test-AnyProcessRunning, Register-SkippedItem, Get-HealthScore, Get-AllAppDefinitions, Get-AppDefinitions, Get-SystemLocations, Get-ConsoleWidth, Get-DisplayText, Get-PathLabel, Format-CompactList, Initialize-CoreSafetyState

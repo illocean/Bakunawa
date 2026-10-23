@@ -29,6 +29,21 @@ Existing cache entries retain `name`, `process` (string or array), `category`, a
 
 `entry` locations never reach the contents-clear routine, so a container's own files cannot be removed by accident. `entryPatterns` matches names only and never descends into subdirectories, and a missing location is reported as absent rather than as an error. Matched entries newer than the age gate are recorded as skipped, not removed, because an install may still be running.
 
+A wildcard in the **last** path segment is resolved against the filesystem when the definitions load, so a location can name an installed build without pinning its version:
+
+```json
+{ "env": "LOCALAPPDATA", "path": "ms-playwright/chromium-*" }
+```
+
+That keeps Playwright's `chromium-<revision>` and `chromium_headless_shell-<revision>` installs targeted while the shared `ms-playwright` parent (`ffmpeg`, `daemon`, `winldd`) is never cleared. If the parent directory is absent the pattern is returned unchanged and cleanup expands it later.
+
+## Special-case targets
+
+Two Dev Caches targets are not plain cache roots and are handled in `src/Bakunawa.Cleanup.psm1` instead of by clearing a location:
+
+- `Maven Repository` (`.m2\repository`) is a dependency store, not a cache. `Clear-MavenPartialArtifacts` reclaims only incomplete downloads (`*.part`, `*.lastUpdated`), and only while no `java` process is running; the repository itself is never cleared.
+- Bun scratch files (`.bun-<pid>-<hash>.node`/`.dll` in the temp root) are matched directly by `Clear-DevCaches`, aged-only, and only while no `bun` process is running.
+
 An optional `orphanRule` supplies the required orphan gate for the entry's exact expanded locations:
 
 ```json

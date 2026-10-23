@@ -1,7 +1,7 @@
 ﻿#requires -Version 5.1
 BeforeAll {
     $repo = (Resolve-Path "$PSScriptRoot/..").Path
-    foreach ($module in @('Core','Config','Cleanup','UI')) {
+    foreach ($module in @('Core','Config','Cleanup','UI','Bootstrap')) {
         Import-Module "$repo/src/Bakunawa.$module.psm1" -Force -DisableNameChecking
     }
 }
@@ -26,6 +26,27 @@ Describe 'Command-line mode routing' {
         # A second guard prevents accidental live cleanup if a routing mock is missed.
         Mock -ModuleName Bakunawa.Cleanup Get-CleanupTasks { throw 'Unexpected real cleanup in routing test' }
         Mock Invoke-CleanupRun {
+            param($Mode)
+            [pscustomobject]@{ Mode = $Mode; IsPreview = ($Mode -eq 'Preview'); DurationSec = 0;
+                PathsCleared = 0; BytesFreed = 0; Errors = @();
+                SkippedItems = @(); CategorySizes = @{}; ScanReport = $null }
+        }
+        # The launcher hands the mode to the bootstrap module, so the mocks that
+        # keep a routing test harmless have to exist in that module too.
+        Mock -ModuleName Bakunawa.Bootstrap Initialize-ConfigModule {}
+        Mock -ModuleName Bakunawa.Bootstrap Get-UserConfig { @{} }
+        Mock -ModuleName Bakunawa.Bootstrap Initialize-CleanupState {}
+        Mock -ModuleName Bakunawa.Bootstrap Set-UiContext {}
+        Mock -ModuleName Bakunawa.Bootstrap Set-UiOptions {}
+        Mock -ModuleName Bakunawa.Bootstrap Set-CleanupSessionScope {}
+        Mock -ModuleName Bakunawa.Bootstrap Show-Header {}
+        Mock -ModuleName Bakunawa.Bootstrap Show-HealthDetail { Write-ReviewLine 'Fixture health summary' }
+        Mock -ModuleName Bakunawa.Bootstrap Find-OrphanFolders { @() }
+        Mock -ModuleName Bakunawa.Bootstrap Get-OrphanScanReport { @{ Findings = @(); Coverage = @(); Issues = @(); DurationSec = 0 } }
+        Mock -ModuleName Bakunawa.Bootstrap Get-CleanupTasks { @([pscustomobject]@{ Name = 'Fixture category'; Parallel = $false }) }
+        Mock -ModuleName Bakunawa.Bootstrap Get-CleanupPotential { [pscustomobject]@{ EstimatedBytes = 4096; FileCount = 1 } }
+        Mock -ModuleName Bakunawa.Bootstrap Get-CleanupErrorLog { @() }
+        Mock -ModuleName Bakunawa.Bootstrap Invoke-CleanupRun {
             param($Mode)
             [pscustomobject]@{ Mode = $Mode; IsPreview = ($Mode -eq 'Preview'); DurationSec = 0;
                 PathsCleared = 0; BytesFreed = 0; Errors = @();

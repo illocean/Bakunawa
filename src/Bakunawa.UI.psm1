@@ -622,7 +622,7 @@ function Show-Menu {
             'Standard'   { Invoke-LoggedOperation -Mode Standard   -Action { Show-CleanupResult (Invoke-CleanupRun 'Standard') } }
             'Aggressive' { Invoke-LoggedOperation -Mode Aggressive -Action { Show-CleanupResult (Invoke-CleanupRun 'Aggressive') } }
             'Preview'    { Invoke-LoggedOperation -Mode Preview    -Action { Show-CleanupResult (Invoke-CleanupRun 'Preview') } }
-            'Scan'       { Invoke-LoggedOperation -Mode Scan       -Action { $null = Find-OrphanFolders -Refresh; Show-OrphanScanResults -ScanResult (Get-OrphanScanReport) -Interactive } }
+            'Scan'       { Invoke-LoggedOperation -Mode Scan       -Action { Initialize-CleanupState -ModeName 'Scan'; $null = Find-OrphanFolders -Refresh; Show-OrphanScanResults -ScanResult (Get-OrphanScanReport) -Interactive } }
             'Health'     { Invoke-LoggedOperation -Mode Health     -Action { Show-HealthDetail } }
         }
         [void](Read-Host '  [Press Enter to return to the menu]')

@@ -46,7 +46,9 @@
       { "env": "LOCALAPPDATA", "path": "BraveSoftware/Brave-Browser/User Data/{profile}/Media Cache" },
       { "env": "LOCALAPPDATA", "path": "BraveSoftware/Brave-Browser/User Data/{profile}/DawnCache" },
       { "env": "LOCALAPPDATA", "path": "BraveSoftware/Brave-Browser/User Data/{profile}/ShaderCache" },
-      { "env": "LOCALAPPDATA", "path": "BraveSoftware/Brave-Browser/User Data/{profile}/blob_storage" }
+      { "env": "LOCALAPPDATA", "path": "BraveSoftware/Brave-Browser/User Data/{profile}/blob_storage" },
+      { "env": "LOCALAPPDATA", "path": "BraveSoftware/Brave-Browser/User Data/{profile}/Service Worker/CacheStorage" },
+      { "env": "LOCALAPPDATA", "path": "BraveSoftware/Brave-Browser/User Data/{profile}/adblock_cache" }
     ]
   },
   {

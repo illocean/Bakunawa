@@ -1,8 +1,25 @@
 ﻿# Loaded into the cleanup module so scan results and cleanup share one state owner.
+$script:SessionScope = $null
+
 function Get-ScanDriveRoots {
     [CmdletBinding()]
     param()
     'C:\'
+}
+
+# The session scope is what the launcher decided once: which config, which scan
+# roots, which extra exclusions. It is stored rather than passed around so the
+# cleanup state can be initialized late (when a mode actually needs it) instead
+# of twice (once by the launcher, once by the run).
+function Set-CleanupSessionScope {
+    [CmdletBinding()]
+    param([hashtable]$Config, [string[]]$ScanRoot, [string[]]$ExtraExcludePath, [switch]$VerboseScan)
+    $script:SessionScope = @{
+        Config          = $Config
+        ScanRoot        = $ScanRoot
+        ExtraExcludePath = $ExtraExcludePath
+        VerboseScan     = [bool]$VerboseScan
+    }
 }
 
 function Initialize-CleanupState {
@@ -10,12 +27,16 @@ function Initialize-CleanupState {
     param([hashtable]$Config, [string[]]$ScanRoot, [string[]]$ExtraExcludePath,
         [switch]$VerboseScan, [switch]$Aggressive, [string]$ModeName)
     if ($PSBoundParameters.ContainsKey('VerboseScan')) { $script:VerboseScan = [bool]$VerboseScan }
+    elseif ($script:SessionScope) { $script:VerboseScan = [bool]$script:SessionScope.VerboseScan }
     if ($PSBoundParameters.ContainsKey('Aggressive')) { $script:IsAggressive = [bool]$Aggressive }
+    if (-not $Config -and $script:SessionScope) { $Config = $script:SessionScope.Config }
     if (-not $Config) { $Config = Get-UserConfig }
     $script:CleanupConfig = $Config
     if ($PSBoundParameters.ContainsKey('ScanRoot')) { $script:ScanRoots = $ScanRoot }
+    elseif ($script:SessionScope -and $script:SessionScope.ScanRoot) { $script:ScanRoots = $script:SessionScope.ScanRoot }
     if (-not $script:ScanRoots -and $Config.scanSettings.roots) { $script:ScanRoots = $Config.scanSettings.roots }
     if ($PSBoundParameters.ContainsKey('ExtraExcludePath')) { $script:ExtraExcludePaths = $ExtraExcludePath }
+    elseif ($script:SessionScope -and $script:SessionScope.ExtraExcludePath) { $script:ExtraExcludePaths = $script:SessionScope.ExtraExcludePath }
     $null = Initialize-CoreSafetyState -Config $Config -ExtraExcludePath $script:ExtraExcludePaths -ModeName $ModeName
     $script:SysLoc = Get-SystemLocations
     $script:RunningProcesses = Get-RunningProcessNames

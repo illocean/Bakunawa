@@ -372,6 +372,13 @@ function Measure-AndClear {
         # Preserve the cache root and process siblings independently when one is locked.
         $size = 0L; $processed = 0
         foreach ($item in (Get-ChildItem -LiteralPath $Path -Force -ErrorAction Stop)) {
+            # A child that is excluded, or that holds an exclusion, is left alone:
+            # sweeping the parent must not take a protected path with it.
+            if (Test-PathProtectedByExclusion $item.FullName) {
+                Register-SkippedItem -Reason 'Path is excluded from cleanup' -Target $item.FullName
+                $script:TaskSkipped++
+                continue
+            }
             try {
                 $size += Remove-ItemSafely -Path $item.FullName -Reason $(if ($Category) { $Category } else { 'Cache cleanup' }) -Preview:$script:IsPreview
                 $processed++
@@ -553,6 +560,15 @@ function Get-CleanupPotential {
                         $count++
                     }
                 }
+                # Mirror Clear-DevCaches: bun scratch files in the temp root, aged matches only.
+                $tmpRoot = Join-EnvPath 'LOCALAPPDATA' 'Temp'
+                if ($tmpRoot -and (Test-Path -LiteralPath $tmpRoot -PathType Container)) {
+                    foreach ($match in @(Get-TransientEntryMatches -Directory $tmpRoot -Patterns @('.bun-*') -EntryType 'file' -MinAgeDays 1)) {
+                        if ($match.Reason -or $null -eq $match.Bytes) { continue }
+                        $bytes += [long]$match.Bytes
+                        $count++
+                    }
+                }
                 # Process every Dev Caches app definition across app-definitions/*.json
                 $extendedDefs = Get-AllAppDefinitions -Category 'Dev Caches'
                 foreach ($app in $extendedDefs) {
@@ -565,6 +581,21 @@ function Get-CleanupPotential {
                         $expandedPath = $expandedPath -replace '{commonprogramfiles}', $env:COMMONPROGRAMFILES
                         $expandedPath = $expandedPath -replace '{systemdrive}', $env:SYSTEMDRIVE
                         $expandedPath = $expandedPath -replace '{windows}', $env:WINDIR
+                        # Mirror Clear-MavenPartialArtifacts: incomplete downloads only,
+                        # never the dependency store itself.
+                        if ($app.Name -eq 'Maven Repository') {
+                            if (Test-Path -LiteralPath $expandedPath -PathType Container) {
+                                foreach ($entry in [Bakunawa.Scanner]::Walk($expandedPath, [string[]]@(Get-CoreExcludedPaths))) {
+                                    if ($entry.Kind -ne 'File' -or -not $entry.Complete) { continue }
+                                    $leaf = [IO.Path]::GetFileName($entry.Path)
+                                    if ($leaf -like '*.part' -or $leaf -like '*.lastUpdated') {
+                                        $bytes += [long]$entry.Bytes
+                                        $count++
+                                    }
+                                }
+                            }
+                            continue
+                        }
                         # Entry-mode locations name a container of disposable leftovers.
                         # Measuring the container itself would report unrelated data.
                         if ($app.Mode -eq 'entry') {
@@ -700,6 +731,15 @@ function Get-CleanupPotential {
                         $count++
                     }
                 }
+                # Bakunawa's own logs: only individual files older than 24 hours are in scope.
+                $ownLogs = Join-EnvPath 'LOCALAPPDATA' 'Bakunawa' 'Logs'
+                if ($ownLogs -and (Test-Path -LiteralPath $ownLogs -PathType Container)) {
+                    foreach ($match in @(Get-TransientEntryMatches -Directory $ownLogs -Patterns @('*.txt') -EntryType 'file' -MinAgeDays 1)) {
+                        if ($match.Reason -or $null -eq $match.Bytes) { continue }
+                        $bytes += [long]$match.Bytes
+                        $count++
+                    }
+                }
             }
             'Thumbnail Cache' {
                 $thumbDir = (Join-EnvPath 'LOCALAPPDATA' 'Microsoft\Windows\Explorer')
@@ -808,6 +848,11 @@ function Get-CleanupPotential {
             }
             'Recycle Bin' {
                 $bytes = Get-DirectorySize -Path 'C:\$Recycle.Bin'
+            }
+            default {
+                # A task without a measurement arm would otherwise report zero bytes
+                # as if nothing were there. Say so instead of guessing.
+                $status = 'not-measured'
             }
         }
         [void]$results.Add([PSCustomObject]@{
@@ -993,7 +1038,7 @@ function Clear-AppCaches {
 
             $appsubcat = "$($app.Name) - $($app.Category)"
             if ($app.Mode -eq 'entry') {
-                $n += Clear-EntryDefinition -App $app -Category $appsubcat
+                $total += Clear-EntryDefinition -App $app -Category $appsubcat
                 continue
             }
             foreach ($resolvedPath in @(Expand-WildcardPath -Path $expandedPath -DirectoriesOnly)) {
@@ -1006,6 +1051,29 @@ function Clear-AppCaches {
         }
     }
     return $total
+}
+
+# Maven's local repository is a dependency store, not a cache: offline builds and
+# existing projects resolve against it, so it is never cleared wholesale. Only files
+# that are incomplete by definition are reclaimable: *.part (a download that never
+# finished) and *.lastUpdated (Maven's fetch-failure markers, rewritten by the next
+# resolution attempt). The definition's `java` process gate keeps this off while any
+# JVM runs, because Maven runs on one and a build may be mid-resolve.
+function Clear-MavenPartialArtifacts {
+    [CmdletBinding()]
+    param([AllowEmptyString()][string]$RepositoryPath, [string]$Category = 'Dev Caches')
+    if ([string]::IsNullOrWhiteSpace($RepositoryPath)) { return 0 }
+    if (-not (Test-CleanupDirectory $RepositoryPath)) { return 0 }
+    # Same busy gate as Measure-AndClear: a running owner skips the whole location.
+    foreach ($busy in @($script:BusyCachePaths)) {
+        if ([Bakunawa.Scanner]::Within($RepositoryPath, $busy) -or [Bakunawa.Scanner]::Within($busy, $RepositoryPath)) {
+            Register-SkippedItem -Reason 'Close the owning app to clean this cache' -Target $RepositoryPath
+            $script:TaskSkipped++
+            Add-CleanupRecord -Path $RepositoryPath -Category $Category -Reason 'in use' -Detail 'Owning application is running'
+            return 0
+        }
+    }
+    return (Remove-FilesByPattern -Directory $RepositoryPath -Patterns @('*.part', '*.lastUpdated') -Category $Category)
 }
 
 function Clear-DevCaches {
@@ -1037,6 +1105,14 @@ function Clear-DevCaches {
         }
     }
 
+    # Bun stages pid-scoped scratch files (.bun-<pid>-<hash>.node/.dll) directly in the
+    # temp root, where the wildcard roots above cannot match them. They are leftovers
+    # once bun is not running, and the age gate keeps files a live run may have written.
+    if ($tempRoot -and -not (Test-AnyProcessRunning -RunningProcesses $script:RunningProcesses -Names @('bun'))) {
+        $n += Clear-TransientEntries -Directory $tempRoot -Patterns @('.bun-*') -EntryType 'file' `
+            -MinAgeDays 1 -Category $cat
+    }
+
     # Process every Dev Caches app definition across app-definitions/*.json
     $extendedDefs = Get-AllAppDefinitions -Category 'Dev Caches'
     foreach ($app in $extendedDefs) {
@@ -1049,6 +1125,13 @@ function Clear-DevCaches {
             $expandedPath = $expandedPath -replace '{commonprogramfiles}',$env:COMMONPROGRAMFILES
             $expandedPath = $expandedPath -replace '{systemdrive}',$env:SYSTEMDRIVE
             $expandedPath = $expandedPath -replace '{windows}',$env:WINDIR
+
+            # Maven's repository store is only ever reclaimed for incomplete downloads
+            # (see Clear-MavenPartialArtifacts); it never falls through to Measure-AndClear.
+            if ($app.Name -eq 'Maven Repository') {
+                $n += Clear-MavenPartialArtifacts -RepositoryPath $expandedPath -Category "$cat - $($app.Name)"
+                continue
+            }
 
             # Entry-mode locations hold disposable leftovers, not a cache root. They must
             # never reach Measure-AndClear: that would clear the container's children,
@@ -1129,6 +1212,15 @@ function Clear-SystemLogFiles {
     $cat = 'Log Files'; $n = 0
     foreach ($logDir in $logDirs) {
         if ($logDir -and (Measure-AndClear $logDir -Category $cat)) { $n++ }
+    }
+    # Bakunawa's own operation logs: retention removes individual files older than
+    # 24 hours and never the log directory. The age gate keeps everything from the
+    # most recent 24 hours, including the log this run is writing; a locked file
+    # fails per file and is reported instead of being forced open.
+    $ownLogs = Join-EnvPath 'LOCALAPPDATA' 'Bakunawa' 'Logs'
+    if ($ownLogs) {
+        $n += Clear-TransientEntries -Directory $ownLogs -Patterns @('*.txt') `
+            -EntryType 'file' -MinAgeDays 1 -Category $cat
     }
     return $n
 }
@@ -1766,6 +1858,7 @@ Export-ModuleMember -Function @(
     'Get-OrphanScanReport',
     'Clear-ReviewedOrphans',
     'Initialize-CleanupState',
+    'Set-CleanupSessionScope',
     'Clear-CachedOrphans',
     'Clear-Prefetch',
     'Clear-AIAgentCaches',

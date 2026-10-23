@@ -52,6 +52,14 @@
     ]
   },
   {
+    "name": "Maven Repository",
+    "process": "java",
+    "category": "Dev Caches",
+    "locations": [
+      { "env": "USERPROFILE", "path": ".m2/repository" }
+    ]
+  },
+  {
     "name": "Bun Cache",
     "process": "bun",
     "category": "Dev Caches",

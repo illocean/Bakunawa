@@ -11,11 +11,19 @@
     "locations": [
       {
         "env": "LOCALAPPDATA",
-        "path": "ms-playwright"
+        "path": "ms-playwright/chromium-*"
+      },
+      {
+        "env": "LOCALAPPDATA",
+        "path": "ms-playwright/chromium_headless_shell-*"
       },
       {
         "env": "USERPROFILE",
-        "path": ".cache/ms-playwright"
+        "path": ".cache/ms-playwright/chromium-*"
+      },
+      {
+        "env": "USERPROFILE",
+        "path": ".cache/ms-playwright/chromium_headless_shell-*"
       }
     ]
   },

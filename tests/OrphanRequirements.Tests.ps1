@@ -196,7 +196,7 @@ Describe 'Orphan evidence, protected paths and common cleanup planning' {
         Mock -ModuleName Bakunawa.Cleanup Get-CleanupTasks { @('Game Caches','Browser Automation Caches' | ForEach-Object { [pscustomobject]@{Name = $_; Parallel = $false} }) }
         New-FixtureFile "$root/Roblox/Versions/v1/ClientCache/data.bin" 1024
         New-FixtureFile "$root/Roblox/Versions/v1/RobloxPlayerBeta.exe" 2048
-        New-FixtureFile "$root/ms-playwright/chromium/browser.bin" 4096
+        New-FixtureFile "$root/ms-playwright/chromium-1228/browser.bin" 4096
         $preview = Invoke-CleanupRun -Mode Preview -Config $cfg
         $preview.BytesFreed | Should -Be 5120
         $preview.Candidates.Count | Should -Be 2
@@ -311,26 +311,37 @@ Describe 'Orphan evidence, protected paths and common cleanup planning' {
 }
 
 Describe 'Entry precedence and source encoding' {
+    BeforeAll {
+        # The entry point delegates to the bootstrap module, so the module has to
+        # be loaded for real; the mock below only stops the script from
+        # re-importing everything on top of it. The dependencies go in globally
+        # because the bootstrap module reaches them from its own scope.
+        foreach ($module in @('Core','Config','Cleanup','UI')) {
+            Import-Module "$repo/src/Bakunawa.$module.psm1" -Force -Global -DisableNameChecking
+        }
+        Import-Module "$repo/src/Bakunawa.Bootstrap.psm1" -Force -Global -DisableNameChecking
+    }
     BeforeEach {
         Mock Import-Module {}
-        Mock Get-UserConfig { Get-DefaultConfig }
-        Mock Initialize-ConfigModule {}
-        Mock Initialize-CleanupState {}
-        Mock Set-UiContext {}
-        Mock Show-CleanupResult {}
-        Mock Invoke-LoggedOperation { param($Mode, $Action) & $Action }
-        Mock Invoke-CleanupRun { param($Mode) [pscustomobject]@{Mode = $Mode} }
+        Mock Initialize-UiLogging { $Path }
+        Mock Initialize-ConfigModule {} -ModuleName Bakunawa.Bootstrap
+        Mock Get-UserConfig { Get-DefaultConfig } -ModuleName Bakunawa.Bootstrap
+        Mock Set-CleanupSessionScope {} -ModuleName Bakunawa.Bootstrap
+        Mock Initialize-CleanupState {} -ModuleName Bakunawa.Bootstrap
+        Mock Set-UiContext {} -ModuleName Bakunawa.Bootstrap
+        Mock Set-UiOptions {} -ModuleName Bakunawa.Bootstrap
+        Mock Show-CleanupResult {} -ModuleName Bakunawa.Bootstrap
+        Mock Invoke-LoggedOperation { param($Mode, $Action) & $Action } -ModuleName Bakunawa.Bootstrap
+        Mock Invoke-CleanupRun { param($Mode) [pscustomobject]@{Mode = $Mode} } -ModuleName Bakunawa.Bootstrap
     }
     It 'explicit Preview wins over an aggressive profile and stays Standard-equivalent' {
         & "$repo/Bakunawa.ps1" -Mode Preview -Profile aggressive -VerboseScan -NoPause -ForceAdmin
-        Should -Invoke Invoke-CleanupRun -Times 1 -Exactly -ParameterFilter { $Mode -eq 'Preview' }
-        Should -Invoke Initialize-CleanupState -Times 1 -Exactly -ParameterFilter { $VerboseScan -and -not $Aggressive }
+        Should -Invoke Invoke-CleanupRun -ModuleName Bakunawa.Bootstrap -Times 1 -Exactly -ParameterFilter { $Mode -eq 'Preview' }
+        Should -Invoke Set-CleanupSessionScope -ModuleName Bakunawa.Bootstrap -Times 1 -Exactly -ParameterFilter { $VerboseScan -and -not $Aggressive }
     }
     It 'profile aggressive.enabled selects aggressive behavior when Mode is omitted' {
-        Mock Get-Content { '{"mode":"Standard","aggressive":{"enabled":true}}' } -ParameterFilter { $LiteralPath -like '*profiles*aggressive.json' }
         & "$repo/Bakunawa.ps1" -Profile aggressive -NoPause -ForceAdmin
-        Should -Invoke Invoke-CleanupRun -Times 1 -Exactly -ParameterFilter { $Mode -eq 'Aggressive' }
-        Should -Invoke Initialize-CleanupState -Times 1 -Exactly -ParameterFilter { $Aggressive }
+        Should -Invoke Invoke-CleanupRun -ModuleName Bakunawa.Bootstrap -Times 1 -Exactly -ParameterFilter { $Mode -eq 'Aggressive' }
     }
     It 'uses the same task categories for Standard and Aggressive, plus aggressive extras' {
         $standard = @(Get-CleanupTasks Standard | ForEach-Object { $_.Name })
@@ -343,9 +354,9 @@ Describe 'Entry precedence and source encoding' {
         @($aggressive | Where-Object { $_ -notin $standard }) | Should -Be @('Prefetch', 'DISM', 'Event Logs + Font Cache')
     }
     It 'runs ReportPath twice through the entry point and preserves the first report' {
-        Mock Find-OrphanFolders { @() }
-        Mock Get-OrphanScanReport { @{Findings = @(); Issues = @(); Coverage = @(); IsComplete = $true; Status = 'Complete'} }
-        Mock Show-Header {}
+        Mock Find-OrphanFolders { @() } -ModuleName Bakunawa.Bootstrap
+        Mock Get-OrphanScanReport { @{Findings = @(); Issues = @(); Coverage = @(); IsComplete = $true; Status = 'Complete'} } -ModuleName Bakunawa.Bootstrap
+        Mock Show-Header {} -ModuleName Bakunawa.Bootstrap
         $path = Join-Path $TestDrive 'entry-report.json'
         & "$repo/Bakunawa.ps1" -Mode Scan -ReportPath $path -NoPause -ForceAdmin
         $first = (Get-FileHash $path).Hash

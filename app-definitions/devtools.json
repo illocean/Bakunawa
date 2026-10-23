@@ -68,6 +68,14 @@
     ]
   },
   {
+    "name": "npm-_cacache",
+    "process": null,
+    "category": "Dev Caches",
+    "locations": [
+      { "env": "LOCALAPPDATA", "path": ".npm/_cacache" }
+    ]
+  },
+  {
     "name": "pnpm-cache",
     "process": null,
     "category": "Dev Caches",
@@ -117,6 +125,14 @@
     "category": "Dev Caches",
     "locations": [
       { "env": "USERPROFILE", "path": ".cache/opencode" }
+    ]
+  },
+  {
+    "name": "codex-package-cache",
+    "process": ["opencode"],
+    "category": "Dev Caches",
+    "locations": [
+      { "env": "USERPROFILE", "path": ".codex/packages" }
     ]
   },
   {
@@ -412,6 +428,14 @@
     "category": "AI Agent Caches",
     "locations": [
       { "env": "USERPROFILE", "path": ".playwright-mcp" }
+    ]
+  },
+  {
+    "name": "jtest2-temps",
+    "process": null,
+    "category": "Dev Caches",
+    "locations": [
+      { "env": "TEMP", "path": "jtest2" }
     ]
   }
 ]

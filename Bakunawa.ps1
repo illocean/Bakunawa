@@ -27,11 +27,8 @@ Import-Module (Join-Path $moduleDir 'Bakunawa.Core.psm1') -Force -Scope Global -
 Import-Module (Join-Path $moduleDir 'Bakunawa.Config.psm1') -Force -Scope Global -ErrorAction Stop -WarningAction SilentlyContinue
 Import-Module (Join-Path $moduleDir 'Bakunawa.Cleanup.psm1') -Force -Scope Global -ErrorAction Stop -WarningAction SilentlyContinue
 Import-Module (Join-Path $moduleDir 'Bakunawa.UI.psm1') -Force -Scope Global -ErrorAction Stop -WarningAction SilentlyContinue
-
-function Show-RunSummary {
-    param([PSCustomObject]$Result)
-    Show-CleanupResult -Result $Result
-}
+# The bootstrap module owns the session: mode resolution, session setup, dispatch.
+Import-Module (Join-Path $moduleDir 'Bakunawa.Bootstrap.psm1') -Force -Scope Global -ErrorAction Stop -WarningAction SilentlyContinue
 
 function Test-IsAdministrator {
     $identity  = [Security.Principal.WindowsIdentity]::GetCurrent()
@@ -150,40 +147,16 @@ function Restart-Elevated {
 }
 
 if (-not $SkipBootstrap) {
-    # Validate mode against allowed values
-    $validModes = @('Menu', 'Standard', 'Aggressive', 'Preview', 'Scan', 'Health', 'Benchmark')
-    if ($Mode -notin $validModes) {
-        Write-Host "Invalid mode: '$Mode'. Valid modes: $($validModes -join ', ')" -ForegroundColor Red
+    # Mode resolution and profile handling live in the bootstrap module so they
+    # can be tested without launching the cleaner.
+    $resolution = Resolve-BakunawaMode -Mode $Mode -Profile $Profile -ProfileRoot $PSScriptRoot `
+        -ModeWasSpecified:$PSBoundParameters.ContainsKey('Mode')
+    if ($resolution.Error) {
+        Write-Host $resolution.Error -ForegroundColor Red
         exit 1
     }
-
-    # Profile handling with validation
-    if ($Profile) {
-        $profilePath = Join-Path $PSScriptRoot "profiles\$Profile.json"
-        if (Test-Path -LiteralPath $profilePath) {
-            try {
-                $profileConfig = Get-Content -LiteralPath $profilePath -Raw -Encoding UTF8 | ConvertFrom-Json -ErrorAction Stop
-                if ($profileConfig.aggressive -and $null -ne $profileConfig.aggressive.enabled -and $profileConfig.aggressive.enabled -isnot [bool]) {
-                    throw 'Profile aggressive.enabled must be a JSON boolean.'
-                }
-                if ($profileConfig.mode -and -not $PSBoundParameters.ContainsKey('Mode')) {
-                    if ($profileConfig.mode -in $validModes) {
-                        $Mode = $profileConfig.mode
-                    } else {
-                        Write-Host "Profile specifies invalid mode: '$($profileConfig.mode)'. Using '$Mode'." -ForegroundColor Yellow
-                    }
-                }
-                # The flag chooses Aggressive only when the caller did not specify a mode.
-                if (-not $PSBoundParameters.ContainsKey('Mode') -and $profileConfig.aggressive.enabled) { $Mode = 'Aggressive' }
-            } catch {
-                Write-Host "Failed to load profile '$Profile': $($_.Exception.Message)" -ForegroundColor Red
-                exit 1
-            }
-        } else {
-            Write-Host "Profile file not found: $profilePath" -ForegroundColor Red
-            exit 1
-        }
-    }
+    if ($resolution.Warning) { Write-Host $resolution.Warning -ForegroundColor Yellow }
+    $Mode = $resolution.Mode
 
     # Modern Terminal relaunch: detect legacy conhost and relaunch via wt.exe
     if ((Test-LegacyConsole) -and -not $ForceAdmin) {
@@ -203,113 +176,18 @@ if (-not $SkipBootstrap) {
         }
         exit 0
     }
-
-    if ($ExtraExcludePath) { $script:ExtraExcludePaths = $ExtraExcludePath }
-    
-    # Validate and set log file path (explicit single-writer contract via UI module)
-    if ($LogFile -and $Mode -ne 'Preview') {
-        try {
-            $null = Initialize-UiLogging -Path $LogFile
-        } catch {
-            Write-Host "Invalid log file path: $($_.Exception.Message)" -ForegroundColor Red
-            exit 1
-        }
-    }
-
-    # Initialize config module with default path
-    $configPath = Join-Path $env:APPDATA 'Bakunawa\config.json'
-    Initialize-ConfigModule -ConfigPath $configPath
-
-    $config = Get-UserConfig -ConfigPath $configPath
-    $extraExclusions = @()
-    if ($config.extraExcludePaths) { $extraExclusions += $config.extraExcludePaths }
-    if ($script:ExtraExcludePaths) { $extraExclusions += $script:ExtraExcludePaths }
-
-    Initialize-CleanupState -Config $config -ScanRoot $ScanRoot -ExtraExcludePath $extraExclusions -VerboseScan:$VerboseScan -Aggressive:($Mode -eq 'Aggressive') -ModeName $Mode
-    Set-UiContext -Mode $Mode
-    Set-UiOptions -NoAnimations:$NoAnimations
-
-    $runMode = {
-    switch ($Mode) {
-        'Standard'   { 
-            Show-RunSummary (Invoke-CleanupRun -Mode 'Standard')
-            Write-Host ''
-        }
-        'Aggressive' { 
-            Show-RunSummary (Invoke-CleanupRun -Mode 'Aggressive')
-            Write-Host ''
-        }
-        'Preview'    { 
-            Show-RunSummary (Invoke-CleanupRun -Mode 'Preview' -WhatIf)
-            Write-Host ''
-        }
-        'Scan'       {
-            Show-Header
-            $null = Find-OrphanFolders -Refresh
-            $report = Get-OrphanScanReport
-            Show-OrphanScanResults -ScanResult $report
-            if ($ReportPath) {
-                Export-ScanReport -Report $report -Path $ReportPath
-                Write-ReviewLine "Report saved: $ReportPath"
-            }
-        }
-        'Health'     {
-            Show-Header
-            Show-HealthDetail
-            Write-Host ''
-        }
-'Benchmark'  {
-            Show-Header
-            Write-Log 'Running performance benchmark...' 'INFO'
-            Write-Log 'This will scan all cleanup categories without deleting anything.' 'INFO'
-            Write-Host ''
-            
-            $totalSb = [System.Diagnostics.Stopwatch]::StartNew()
-            $categoryTimes = @{}
-            
-            $tasks = Get-CleanupTasks -Mode 'Standard'
-            Reset-CleanupProgress
-            foreach ($task in $tasks) {
-                Start-Step -Name $task.Name -Total $tasks.Count
-                $taskSb = [System.Diagnostics.Stopwatch]::StartNew()
-                $potential = Get-CleanupPotential -Mode 'Standard' -TaskName $task.Name
-                $taskSb.Stop()
-                $categoryTimes[$task.Name] = [math]::Round($taskSb.Elapsed.TotalMilliseconds, 2)
-                if ($potential) {
-                    Write-Log ("{0} | {1} ms | Estimated: {2} | {3} locations" -f $task.Name, $categoryTimes[$task.Name], (Format-FileSize $potential.EstimatedBytes), $potential.FileCount) 'SCAN'
-                } else {
-                    Write-Log ("{0} | {1} ms | No data" -f $task.Name, $categoryTimes[$task.Name]) 'SCAN'
-                }
-                Finish-Step -Summary 'Measurement finished'
-            }
-            
-            $totalSb.Stop()
-            $totalMs = [math]::Round($totalSb.Elapsed.TotalMilliseconds, 2)
-            
-            Write-Host ''
-            Write-ReportTitle 'Benchmark summary' -Meta (Format-ReportDuration $totalSb.Elapsed.TotalSeconds)
-            Write-ReportRow ('Total milliseconds  {0}' -f $totalMs)
-            Write-ReportRow ('Categories measured  {0}' -f $tasks.Count)
-            Write-ReportRow ('Recorded errors  {0}' -f @(Get-CleanupErrorLog).Count)
-            Write-ReportRow 'Category estimates do not establish complete filesystem coverage.' -Color DarkGray
-            Write-ReportRow 'Slowest categories:' -Color DarkGray
-            
-            # Show top 5 slowest categories
-            $sorted = $categoryTimes.GetEnumerator() | Sort-Object Value -Descending | Select-Object -First 5
-            foreach ($entry in $sorted) {
-                Write-ReportRow ('{0}{1,8} ms' -f ('    ' + $entry.Key), $entry.Value) -Color DarkGray
-                Write-ScanLogText ("{0}: {1}ms" -f $entry.Key, $entry.Value)
-            }
-            
-            Write-ReportRow 'Timing depends on data size, access, and cached results. No files were deleted.' -Color DarkGray
-            
-            Write-Host ''
-        }
-        default      { Show-Menu }
-    }
-    }
-    if ($Mode -eq 'Menu') { & $runMode }
-    else { Invoke-LoggedOperation -Mode $Mode -Action $runMode }
-
-    if (-not $NoPause) { [void](Read-Host 'Press Enter to close') }
 }
+
+# The session is always prepared: config, logging and the cleanup scope decide
+# what a run is allowed to touch. Only the pre-flight above is skipped.
+try {
+    $null = Initialize-BakunawaSession -Mode $Mode -ScanRoot $ScanRoot -ExtraExcludePath $ExtraExcludePath `
+        -VerboseScan:$VerboseScan -NoAnimations:$NoAnimations -LogFile $LogFile
+} catch {
+    Write-Host $_.Exception.Message -ForegroundColor Red
+    exit 1
+}
+
+Invoke-BakunawaMode -Mode $Mode -ReportPath $ReportPath
+
+if (-not $NoPause) { [void](Read-Host 'Press Enter to close') }
