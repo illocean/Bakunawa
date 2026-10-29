@@ -1,5 +1,7 @@
 # Bakunawa
 
+![Bakunawa preview](bakunawapreview.png)
+
 Windows PowerShell 5.1 cleaner for **local disk C: only**, with cleanup previews and application-aware cache and orphan review.
 
 Run the existing menu:
