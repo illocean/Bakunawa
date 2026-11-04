@@ -128,11 +128,11 @@ function Show-OrphanScanResults {
         Write-ReportRow ("Page {0}/{1} · N next · P previous · E export · I scan issues · Q return" -f ($page + 1), [math]::Max(1, [math]::Ceiling($findings.Count / $pageSize))) -Color DarkGray
         Write-ReportRow 'Enter item numbers separated by commas to review a selection.' -Color DarkGray
         $choice = (Read-Host 'Review').Trim()
-        switch ($choice.ToUpperInvariant()) {
-            'Q' { return }
-            'N' { if (($page + 1) * $pageSize -lt $findings.Count) { $page++ }; continue }
-            'P' { $page = [math]::Max(0, $page - 1); continue }
-            'E' {
+        $command = $choice.ToUpperInvariant()
+        if ($command -eq 'Q') { return }
+        elseif ($command -eq 'N') { $page = [math]::Min([math]::Ceiling($findings.Count / $pageSize) - 1, $page + 1); continue }
+        elseif ($command -eq 'P') { $page = [math]::Max(0, $page - 1); continue }
+        elseif ($command -eq 'E') {
                 $destination = Read-Host 'Report file path (.json)'
                 if ($destination) {
                     try {
@@ -142,7 +142,7 @@ function Show-OrphanScanResults {
                 }
                 continue
             }
-            'I' {
+        elseif ($command -eq 'I') {
                 # The same protected path is reported by every walker that meets
                 # it. The log keeps each occurrence; the screen shows each once.
                 $issues = @($ScanResult.Issues | Where-Object { $_ } | Sort-Object Kind, Path, Reason -Unique)
@@ -152,8 +152,7 @@ function Show-OrphanScanResults {
                     Write-ReportRow ('{0,-10}{1}' -f $issue.Kind, $issue.Path) -Color $(if ($issue.Kind -eq 'Error') { 'Red' } else { 'Yellow' })
                     Write-ReportRow ('{0}{1}' -f (' ' * 10), $issue.Reason) -Color DarkGray
                 }
-                [void](Read-Host 'Press Enter to return to review'); continue
-            }
+            [void](Read-Host 'Press Enter to return to review'); continue
         }
         if ($choice -notmatch '^\d+(\s*,\s*\d+)*$') { Write-ReviewLine 'Choose a listed command or item number.'; continue }
         try { $numbers = @($choice -split ',' | ForEach-Object { [int]$_.Trim() } | Sort-Object -Unique) }

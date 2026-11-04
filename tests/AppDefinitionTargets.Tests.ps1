@@ -103,8 +103,8 @@ Describe 'Objective targets are wired into the app definitions' {
         $paths = @($pw | ForEach-Object { $_.Path })
         @($paths | Where-Object { $_ -match 'ms-playwright$' }) |
             Should -BeNullOrEmpty -Because 'the whole ms-playwright parent also holds ffmpeg/daemon/winldd and must not be a clear target'
-        @($paths | Where-Object { $_ -match 'chromium-1228$' }) | Should -Not -BeNullOrEmpty
-        @($paths | Where-Object { $_ -match 'chromium_headless_shell-1228$' }) | Should -Not -BeNullOrEmpty
+        @($paths | Where-Object { $_ -match 'chromium-[0-9*]+$' }) | Should -Not -BeNullOrEmpty
+        @($paths | Where-Object { $_ -match 'chromium_headless_shell-[0-9*]+$' }) | Should -Not -BeNullOrEmpty
     }
 
     It 'keeps the browser-automation caches process-gated on the owning runtime' {

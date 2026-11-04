@@ -281,26 +281,6 @@ function Get-CleanupErrorLog {
     if ($script:Errors) { return @($script:Errors) }
 }
 
-# Private helper: measure one entry-mode definition (container whose matching
-# children are themselves the disposable artifact). Returns 0 for definitions
-# whose location is absent or non-entry, so a contents-mode definition keeps
-# falling through to the Measure-AndClear branch.
-function Measure-EntryDefinition {
-    [CmdletBinding()]
-    param([Parameter(Mandatory)][object]$App)
-    if ($App.Mode -ne 'entry' -or -not $App.EntryPatterns) { return 0 }
-    $ageDays = Get-TransientAgeDays -Override $App.MinAgeDays
-    $bytes = 0L
-    foreach ($dir in @(Expand-WildcardPath -Path $App.Path -DirectoriesOnly)) {
-        if (-not $dir -or -not (Test-Path -LiteralPath $dir -PathType Container)) { continue }
-        foreach ($match in @(Get-TransientEntryMatches -Directory $dir -Patterns @($App.EntryPatterns) -EntryType $App.EntryType -MinAgeDays $ageDays)) {
-            if ($match.Reason -or $null -eq $match.Bytes) { continue }
-            $bytes += [long]$match.Bytes
-        }
-    }
-    return [long]$bytes
-}
-
 # Private helper: clear one entry-mode definition. 0 when the definition is not
 # entry-mode, so contents-mode definitions keep their existing behaviour.
 function Clear-EntryDefinition {

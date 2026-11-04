@@ -119,8 +119,8 @@ function Write-ReportRow {
         $break = $plain.LastIndexOf(' ', $width)
         if ($break -lt [int]($width / 2)) { $break = $width }
         Write-Host ($indent + $plain.Substring(0, $break)) -ForegroundColor $Color
-        $plain = $indent + '   ' + $plain.Substring($break).TrimStart(' ')
-        $width -= 3
+        $plain = $indent + '     ' + $plain.Substring($break).TrimStart(' ')
+        $width -= ($script:UiGutter + 5)
     }
     Write-Host ($indent + $plain) -ForegroundColor $Color
 }

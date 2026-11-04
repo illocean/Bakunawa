@@ -677,8 +677,12 @@ function Get-AllAppDefinitions {
                     if ($fullPath -match '[*?]') {
                         $parent = Split-Path -Parent $fullPath
                         if ($parent -and (Test-Path -LiteralPath $parent -PathType Container)) {
-                            $paths = @(Get-ChildItem -LiteralPath $parent -Filter (Split-Path -Leaf $fullPath) -Directory -ErrorAction SilentlyContinue |
+                            $children = @(Get-ChildItem -LiteralPath $parent -Filter (Split-Path -Leaf $fullPath) -Directory -ErrorAction SilentlyContinue |
                                 ForEach-Object { $_.FullName })
+                            if ($children.Count -gt 0) { $paths = $children }
+                            # Fallthrough: keep the unresolved wildcard pattern so the
+                            # definition survives and cleanup expands it against real
+                            # installed builds instead of losing the target entirely.
                         }
                     }
                     $options = Get-LocationOptions -Location $loc
