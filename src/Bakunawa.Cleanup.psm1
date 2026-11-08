@@ -187,23 +187,67 @@ function Get-TransientAgeDays {
 function Get-TransientSkipDetail {
     param([string]$Reason, [int]$MinAgeDays)
     switch ($Reason) {
-        'protected' { 'Protected folder or exclusion' }
-        'in use'    { 'Owning application is running' }
-        'not stale' { "Newest write is less than $MinAgeDays days old; an install may be in progress" }
-        default     { $Reason }
+        'protected'        { 'Protected folder or exclusion' }
+        'in use'           { 'Owning application is running' }
+        'not stale'        { "Newest write is less than $MinAgeDays days old; an install may be in progress" }
+        'current release'  { 'Currently used release (current junction); kept' }
+        'kept latest'      { 'Newest retained entry (keepLatest); kept' }
+        default            { $Reason }
     }
+}
+
+# Private helper: $true when $Left names a newer version than $Right. Compares the
+# numeric runs of each name ('0.100.0' beats '0.99.0', where a plain string sort does
+# not) and falls back to an ordinal name compare on a tie so the order is total.
+function Compare-VersionName {
+    [CmdletBinding()]
+    param([string]$Left, [string]$Right)
+    $leftParts = @($Left -split '[^0-9]+' | Where-Object { $_ })
+    $rightParts = @($Right -split '[^0-9]+' | Where-Object { $_ })
+    $count = [Math]::Max($leftParts.Count, $rightParts.Count)
+    for ($i = 0; $i -lt $count; $i++) {
+        $l = if ($i -lt $leftParts.Count) { [long]$leftParts[$i] } else { -1 }
+        $r = if ($i -lt $rightParts.Count) { [long]$rightParts[$i] } else { -1 }
+        if ($l -ne $r) { return $l -gt $r }
+    }
+    return [string]::CompareOrdinal($Left, $Right) -gt 0
+}
+
+# Private helper: resolve a reparse point to the full path it names, or $null. Only a
+# real reparse point whose target resolves inside $ContainerFull qualifies: a path
+# outside the container cannot name one of its entries, and a plain directory named
+# 'current' is not a pointer at all.
+function Get-PointerTarget {
+    [CmdletBinding()]
+    param([AllowEmptyString()][string]$PointerPath, [string]$ContainerFull)
+    if ([string]::IsNullOrWhiteSpace($PointerPath) -or [string]::IsNullOrWhiteSpace($ContainerFull)) { return $null }
+    try {
+        $pointer = Get-Item -LiteralPath $PointerPath -Force -ErrorAction Stop
+        if (-not ($pointer.Attributes -band [System.IO.FileAttributes]::ReparsePoint)) { return $null }
+        if (-not $pointer.Target) { return $null }
+        $resolved = [IO.Path]::GetFullPath($pointer.Target).TrimEnd('\')
+        if ($resolved.StartsWith("$ContainerFull\", [StringComparison]::OrdinalIgnoreCase)) { return $resolved }
+    } catch { }
+    return $null
 }
 
 # Read-only enumeration of disposable entries directly inside a container directory.
 # Unlike Expand-WildcardPath this matches names only, never descends, and reports why
 # a match would be skipped so callers log the same decision they act on.
+# KeepLatest marks the newest N matching entries as 'kept latest', evaluated BEFORE
+# the age/exclusion checks so the newest backup can never delete. KeepTargetOf names a
+# sibling reparse point (Codex keeps 'current' one level up from 'releases'); the entry
+# it resolves to is reported 'current release' and the newest-N fallback is skipped,
+# because guessing a new "newest" could delete the live release.
 function Get-TransientEntryMatches {
     [CmdletBinding()]
     param(
         [AllowEmptyString()][string]$Directory,
         [Parameter(Mandatory)][string[]]$Patterns,
         [ValidateSet('any','file','directory')][string]$EntryType = 'any',
-        [ValidateRange(0, 3650)][int]$MinAgeDays = 0
+        [ValidateRange(0, 3650)][int]$MinAgeDays = 0,
+        [ValidateRange(0, 10000)][int]$KeepLatest = 0,
+        [AllowEmptyString()][string]$KeepTargetOf = ''
     )
     if ([string]::IsNullOrWhiteSpace($Directory)) { return }
     # A missing container is normal: the tool simply is not installed here.
@@ -215,25 +259,176 @@ function Get-TransientEntryMatches {
     $cutoff = if ($MinAgeDays -gt 0) { (Get-Date).AddDays(-$MinAgeDays) } else { $null }
     try { $entries = @(Get-ChildItem -LiteralPath $Directory -Force -ErrorAction Stop) }
     catch { Register-CleanupError -Path $Directory -Message $_.Exception.Message; return }
+    # Retention set, keyed by full path. Only consulted for a matching entry, so an
+    # out-of-scope pointer can never protect something the caller never targets.
+    $retained = @{}
+    $dirFull = [IO.Path]::GetFullPath($Directory).TrimEnd('\')
+    $pointerTarget = $null
+    $pointerIsSibling = $false
+    if ($KeepTargetOf) {
+        $pointerTarget = Get-PointerTarget -PointerPath ([IO.Path]::GetFullPath((Join-Path $Directory $KeepTargetOf))) -ContainerFull $dirFull
+        $pointerIsSibling = $true
+    } elseif ($KeepLatest -gt 0) {
+        # Default: a 'current' reparse point living inside the container.
+        $pointerTarget = Get-PointerTarget -PointerPath (Join-Path $Directory 'current') -ContainerFull $dirFull
+    }
+    if ($pointerTarget) { $retained[$pointerTarget] = 'current release' }
+    # A pointer whose target is nested deeper (a child of a child) is not in the
+    # direct-entry set, so only a direct-child pointer suppresses the newest-N rule.
+    $nested = $pointerTarget -and $pointerTarget.IndexOf('\', $dirFull.Length + 1) -ge 0
+    if ($KeepLatest -gt 0 -and -not $nested) {
+        $candidates = @($entries | Where-Object {
+            $matched = $false
+            foreach ($pattern in $Patterns) { if ($_.Name -like $pattern) { $matched = $true; break } }
+            if (-not $matched) { return $false }
+            if ($EntryType -eq 'directory' -and -not $_.PSIsContainer) { return $false }
+            if ($EntryType -eq 'file' -and $_.PSIsContainer) { return $false }
+            return $true
+        })
+        # Version order when a sibling pointer names the live entry: LastWriteTime
+        # would keep a newer, unused build and let the older one the pointer names be
+        # deleted, and a plain name sort puts '0.99.0' above '0.100.0'. So take the
+        # newest by numeric segments, picked by repeated max-scan (PowerShell cannot
+        # sort an array-valued property the way a version compare needs).
+        if ($pointerIsSibling) {
+            $remaining = [System.Collections.Generic.List[object]]::new()
+            foreach ($entry in $candidates) { $remaining.Add($entry) }
+            for ($i = 0; $i -lt $KeepLatest -and $remaining.Count -gt 0; $i++) {
+                $bestIndex = 0
+                for ($j = 1; $j -lt $remaining.Count; $j++) {
+                    if (Compare-VersionName -Left $remaining[$j].Name -Right $remaining[$bestIndex].Name) { $bestIndex = $j }
+                }
+                $key = [IO.Path]::GetFullPath($remaining[$bestIndex].FullName).TrimEnd('\')
+                if (-not $retained.ContainsKey($key)) { $retained[$key] = 'kept latest' }
+                $remaining.RemoveAt($bestIndex)
+            }
+        } else {
+            foreach ($entry in @($candidates | Sort-Object LastWriteTime -Descending | Select-Object -First $KeepLatest)) {
+                $key = [IO.Path]::GetFullPath($entry.FullName).TrimEnd('\')
+                if (-not $retained.ContainsKey($key)) { $retained[$key] = 'kept latest' }
+            }
+        }
+    }
+    # Candidates are reported through their literal path: Get-ChildItem follows a
+    # same-named junction, which would report the target instead of the entry.
     foreach ($entry in $entries) {
         $matched = $false
         foreach ($pattern in $Patterns) { if ($entry.Name -like $pattern) { $matched = $true; break } }
         if (-not $matched) { continue }
         if ($EntryType -eq 'directory' -and -not $entry.PSIsContainer) { continue }
         if ($EntryType -eq 'file' -and $entry.PSIsContainer) { continue }
+        $literal = Join-Path $Directory $entry.Name
+        try { $item = Get-Item -LiteralPath $literal -Force -ErrorAction Stop } catch { $item = $entry }
+        $itemKey = [IO.Path]::GetFullPath($item.FullName).TrimEnd('\')
         $reason = $null
-        if (Test-IsExcludedPath $entry.FullName) { $reason = 'protected' }
-        elseif (-not $entry.PSIsContainer -and (Test-ProtectedFileExtension $entry.Name)) { $reason = 'protected' }
-        elseif ($cutoff -and $entry.LastWriteTime -ge $cutoff) { $reason = 'not stale' }
-        elseif ($script:BusyCachePaths) {
+        if ($retained.ContainsKey($itemKey)) { $reason = $retained[$itemKey] }
+        elseif (Test-IsExcludedPath $item.FullName) { $reason = 'protected' }
+        elseif (-not $item.PSIsContainer -and (Test-ProtectedFileExtension $item.Name)) { $reason = 'protected' }
+        elseif ($cutoff -and $item.LastWriteTime -ge $cutoff) { $reason = 'not stale' }
+        if (-not $reason -and $script:BusyCachePaths) {
             foreach ($busy in $script:BusyCachePaths) {
-                if ([Bakunawa.Scanner]::Within($entry.FullName, $busy) -or [Bakunawa.Scanner]::Within($busy, $entry.FullName)) { $reason = 'in use'; break }
+                if ([Bakunawa.Scanner]::Within($item.FullName, $busy) -or [Bakunawa.Scanner]::Within($busy, $item.FullName)) { $reason = 'in use'; break }
             }
         }
         $bytes = $null
-        try { $bytes = [long]([Bakunawa.Scanner]::Inspect($entry.FullName, [string[]]@(Get-CoreExcludedPaths))).Bytes } catch { }
-        [PSCustomObject]@{ FullName = $entry.FullName; Name = $entry.Name; Bytes = $bytes; IsContainer = [bool]$entry.PSIsContainer; Reason = $reason }
+        try { $bytes = [long]([Bakunawa.Scanner]::Inspect($item.FullName, [string[]]@(Get-CoreExcludedPaths))).Bytes } catch { }
+        [PSCustomObject]@{ FullName = $item.FullName; Name = $entry.Name; Bytes = $bytes; IsContainer = [bool]$item.PSIsContainer; Reason = $reason }
     }
+}
+
+# Downloads maintenance targets. Downloads is a hard-excluded known folder
+# (Get-ExcludedPaths), so nothing here may route through Test-IsExcludedPath or
+# Expand-WildcardPath, which consult it on every ancestor. Two fixed trees
+# only, direct children only (never recursion): old installers at the
+# Downloads root, and the portable app's binaries in its own app folder. The
+# C:-only guard below is deliberately NOT an exclusion consult: IsAllowedPath
+# rejects non-C: and reparse paths without looking at the exclusion list, so
+# the user-requested Downloads scope is reachable while any other drive or
+# junction never is. Everything else under Downloads is conservatively kept,
+# including portable apps that normally reinstall by dropping a new exe beside
+# themselves. Returns matches with Bytes so clear and measure agree.
+function Get-DownloadsMaintenanceMatches {
+    [CmdletBinding()]
+    param([string]$Category = 'Package Maintenance')
+    $downloads = Join-EnvPath 'USERPROFILE' 'Downloads'
+    $matches = [System.Collections.Generic.List[object]]::new()
+    if (-not $downloads -or -not (Test-Path -LiteralPath $downloads -PathType Container)) { return @() }
+    # Reject the whole scope before enumerating anything: a junctioned or
+    # off-C: Downloads root must never be enumerated for deletion candidates.
+    if (-not [Bakunawa.Scanner]::IsAllowedPath($downloads)) {
+        Register-SkippedItem -Reason ([Bakunawa.Scanner]::PathIssue($downloads)) -Target $downloads
+        return @()
+    }
+    # Installers in the Downloads root only (never into subfolders): the age gate
+    # keeps anything recently downloaded, so a file mid-use can never be a match.
+    $installerPatterns = @('*.Installer.exe', '*Setup*.exe', '*Install*.exe', '*Telegram*.exe', '*-setup.exe', '*.msi')
+    $installerCutoff = (Get-Date).AddDays(-30)
+    try { $files = @(Get-ChildItem -LiteralPath $downloads -File -Force -ErrorAction Stop) }
+    catch { Register-CleanupError -Path $downloads -Category $Category -Message $_.Exception.Message; return @() }
+    foreach ($file in $files) {
+        $matched = $false
+        foreach ($pattern in $installerPatterns) { if ($file.Name -like $pattern) { $matched = $true; break } }
+        if (-not $matched) { continue }
+        $reason = $null
+        if (Test-ProtectedFileExtension $file.Name) { $reason = 'protected' }
+        elseif ($file.LastWriteTime -ge $installerCutoff) { $reason = 'not stale' }
+        $bytes = $null
+        try { $bytes = [long]([Bakunawa.Scanner]::Inspect($file.FullName, [string[]]@(Get-CoreExcludedPaths))).Bytes } catch { }
+        $matches.Add([PSCustomObject]@{ FullName = $file.FullName; Name = $file.Name; Bytes = $bytes; IsContainer = $false; Reason = $reason })
+    }
+    # The portable app keeps its session in tdata beside the executable, so deleting
+    # the exe beside it breaks the app until it self-updates. Only the install
+    # binaries in the app root are candidates; tdata and every other file stay.
+    $appDir = Join-Path $downloads 'Telegram Desktop\AyuGram'
+    if ($appDir -and (Test-Path -LiteralPath $appDir -PathType Container)) {
+        # An app folder reached through a junction must never be swept as if
+        # it were the real install directory.
+        if (-not [Bakunawa.Scanner]::IsAllowedPath($appDir)) {
+            Register-SkippedItem -Reason ([Bakunawa.Scanner]::PathIssue($appDir)) -Target $appDir
+        } else {
+        try { $appFiles = @(Get-ChildItem -LiteralPath $appDir -File -Force -ErrorAction Stop) }
+        catch { Register-CleanupError -Path $appDir -Category $Category -Message $_.Exception.Message; $appFiles = @() }
+        foreach ($file in $appFiles) {
+            if ($file.Name -notin @('AyuGram.exe', 'Updater.exe') -and $file.Name -notlike '*.msi' -and $file.Name -notlike '*.zip' -and $file.Name -notlike '*.msix' -and $file.Name -notlike '*.appx') { continue }
+            $reason = $null
+            if (Test-ProtectedFileExtension $file.Name) { $reason = 'protected' }
+            elseif ($file.LastWriteTime -ge $installerCutoff) { $reason = 'not stale' }
+            $bytes = $null
+            try { $bytes = [long]([Bakunawa.Scanner]::Inspect($file.FullName, [string[]]@(Get-CoreExcludedPaths))).Bytes } catch { }
+            $matches.Add([PSCustomObject]@{ FullName = $file.FullName; Name = $file.Name; Bytes = $bytes; IsContainer = $false; Reason = $reason })
+        }
+        }
+    }
+    return @($matches)
+}
+
+function Clear-DownloadsMaintenance {
+    [CmdletBinding()]
+    param()
+    $cat = 'Package Maintenance'
+    $n = 0
+    foreach ($match in @(Get-DownloadsMaintenanceMatches -Category $cat)) {
+        if ($match.Reason) {
+            $detail = Get-TransientSkipDetail -Reason $match.Reason -MinAgeDays 30
+            Register-SkippedItem -Reason $detail -Target $match.FullName -Category $cat -Bytes $match.Bytes
+            Add-CleanupRecord -Path $match.FullName -Category $cat -Bytes $match.Bytes -Reason $match.Reason -Detail $detail
+            continue
+        }
+        try {
+            $size = Remove-ItemSafely -Path $match.FullName -Reason $cat -Preview:$script:IsPreview
+            $script:BytesFreed += $size
+            $script:TaskBytes += $size
+            $script:TaskCleared++
+            if (-not $script:CategorySizes) { $script:CategorySizes = @{} }
+            if (-not $script:CategorySizes.ContainsKey($cat)) { $script:CategorySizes[$cat] = [long]0 }
+            $script:CategorySizes[$cat] += [long]$size
+            Write-CommandLog $(if ($script:IsPreview) { 'PREVIEW' } else { 'PROCESSED' }) "$($match.FullName) ($(Format-FileSize $size))"
+            $n++
+        } catch {
+            Register-CleanupError -Path $match.FullName -Category $cat -Message $_.Exception.Message
+        }
+    }
+    return $n
 }
 
 # Check-then-delete for install-staging leftovers. Measure-AndClear cannot do this job:
@@ -246,10 +441,12 @@ function Clear-TransientEntries {
         [Parameter(Mandatory)][string[]]$Patterns,
         [ValidateSet('any','file','directory')][string]$EntryType = 'any',
         [ValidateRange(0, 3650)][int]$MinAgeDays = 0,
+        [ValidateRange(0, 10000)][int]$KeepLatest = 0,
+        [string]$KeepTargetOf = '',
         [string]$Category = 'Dev Caches'
     )
     $count = 0
-    foreach ($match in @(Get-TransientEntryMatches -Directory $Directory -Patterns $Patterns -EntryType $EntryType -MinAgeDays $MinAgeDays)) {
+    foreach ($match in @(Get-TransientEntryMatches -Directory $Directory -Patterns $Patterns -EntryType $EntryType -MinAgeDays $MinAgeDays -KeepLatest $KeepLatest -KeepTargetOf $KeepTargetOf)) {
         if ($match.Reason) {
             $detail = Get-TransientSkipDetail -Reason $match.Reason -MinAgeDays $MinAgeDays
             Register-SkippedItem -Reason $detail -Target $match.FullName -Category $Category -Bytes $match.Bytes
@@ -295,7 +492,7 @@ function Clear-EntryDefinition {
         # age cutoff and busy-cache checks; Clear-TransientEntries deletes via
         # Remove-ItemSafely, which honours $script:IsPreview.
         $cleared += Clear-TransientEntries -Directory $dir -Patterns @($App.EntryPatterns) `
-            -EntryType $App.EntryType -MinAgeDays $ageDays -Category $Category
+            -EntryType $App.EntryType -MinAgeDays $ageDays -KeepLatest ($App.KeepLatest) -KeepTargetOf ([string]$App.KeepTargetOf) -Category $Category
     }
     return $cleared
 }
@@ -412,6 +609,7 @@ function Get-CleanupTasks {
         $null = $tasks.Add([PSCustomObject]@{ Name = 'Prefetch' })
         $null = $tasks.Add([PSCustomObject]@{ Name = 'DISM' })
         $null = $tasks.Add([PSCustomObject]@{ Name = 'Event Logs + Font Cache' })
+        $null = $tasks.Add([PSCustomObject]@{ Name = 'Package Maintenance' })
     }
     return @($tasks)
 }
@@ -487,7 +685,7 @@ function Get-CleanupPotential {
                         $ageDays = Get-TransientAgeDays -Override $app.MinAgeDays
                         foreach ($dir in @(Expand-WildcardPath -Path $expandedPath -DirectoriesOnly)) {
                             if (-not $dir -or -not (Test-Path -LiteralPath $dir -PathType Container)) { continue }
-                            foreach ($match in @(Get-TransientEntryMatches -Directory $dir -Patterns @($app.EntryPatterns) -EntryType $app.EntryType -MinAgeDays $ageDays)) {
+                            foreach ($match in @(Get-TransientEntryMatches -Directory $dir -Patterns @($app.EntryPatterns) -EntryType $app.EntryType -MinAgeDays $ageDays -KeepLatest ($app.KeepLatest) -KeepTargetOf ([string]$app.KeepTargetOf))) {
                                 if ($match.Reason -or $null -eq $match.Bytes) { continue }
                                 $bytes += [long]$match.Bytes
                                 $count++
@@ -510,7 +708,7 @@ function Get-CleanupPotential {
                         $ageDays = Get-TransientAgeDays -Override $app.MinAgeDays
                         foreach ($d in @(Expand-WildcardPath -Path $app.Path -DirectoriesOnly)) {
                             if (-not $d -or -not (Test-Path -LiteralPath $d -PathType Container)) { continue }
-                            foreach ($match in @(Get-TransientEntryMatches -Directory $d -Patterns @($app.EntryPatterns) -EntryType $app.EntryType -MinAgeDays $ageDays)) {
+                            foreach ($match in @(Get-TransientEntryMatches -Directory $d -Patterns @($app.EntryPatterns) -EntryType $app.EntryType -MinAgeDays $ageDays -KeepLatest ($app.KeepLatest) -KeepTargetOf ([string]$app.KeepTargetOf))) {
                                 if ($match.Reason -or $null -eq $match.Bytes) { continue }
                                 $bytes += [long]$match.Bytes
                                 $count++
@@ -583,7 +781,7 @@ function Get-CleanupPotential {
                             $ageDays = Get-TransientAgeDays -Override $app.MinAgeDays
                             foreach ($dir in @(Expand-WildcardPath -Path $expandedPath -DirectoriesOnly)) {
                                 if (-not $dir -or -not (Test-Path -LiteralPath $dir -PathType Container)) { continue }
-                                foreach ($match in @(Get-TransientEntryMatches -Directory $dir -Patterns @($app.EntryPatterns) -EntryType $app.EntryType -MinAgeDays $ageDays)) {
+                                foreach ($match in @(Get-TransientEntryMatches -Directory $dir -Patterns @($app.EntryPatterns) -EntryType $app.EntryType -MinAgeDays $ageDays -KeepLatest ($app.KeepLatest) -KeepTargetOf ([string]$app.KeepTargetOf))) {
                                     if ($match.Reason -or $null -eq $match.Bytes) { continue }
                                     $bytes += [long]$match.Bytes
                                     $count++
@@ -693,6 +891,16 @@ function Get-CleanupPotential {
                 # Component-store savings depend on servicing history and are not
                 # predictable; reported as no estimate rather than a guess.
             }
+            'Package Maintenance' {
+                # Scoop's savings depend on which versions are still cached and are
+                # not predictable; reported as no estimate rather than a guess.
+                # The Downloads installers are measured so the user sees the reclaim.
+                foreach ($match in @(Get-DownloadsMaintenanceMatches -Category 'Package Maintenance')) {
+                    if ($match.Reason -or $null -eq $match.Bytes) { continue }
+                    $bytes += [long]$match.Bytes
+                    $count++
+                }
+            }
             'GPU/Shell Caches' {
                 foreach ($g in @((Join-EnvPath 'LOCALAPPDATA' 'Microsoft' 'Windows' 'DXCache'))) {
                     if ($g -and (Test-Path -LiteralPath $g -PathType Container)) {
@@ -798,7 +1006,7 @@ function Get-CleanupPotential {
                         $ageDays = Get-TransientAgeDays -Override $app.MinAgeDays
                         foreach ($dir in @(Expand-WildcardPath -Path $expandedPath -DirectoriesOnly)) {
                             if (-not $dir -or -not (Test-Path -LiteralPath $dir -PathType Container)) { continue }
-                            foreach ($match in @(Get-TransientEntryMatches -Directory $dir -Patterns @($app.EntryPatterns) -EntryType $app.EntryType -MinAgeDays $ageDays)) {
+                            foreach ($match in @(Get-TransientEntryMatches -Directory $dir -Patterns @($app.EntryPatterns) -EntryType $app.EntryType -MinAgeDays $ageDays -KeepLatest ($app.KeepLatest) -KeepTargetOf ([string]$app.KeepTargetOf))) {
                                 if ($match.Reason -or $null -eq $match.Bytes) { continue }
                                 $bytes += [long]$match.Bytes
                                 $count++
@@ -1118,8 +1326,14 @@ function Clear-DevCaches {
             # deleting the tool's own files (the npm prefix holds its shims).
             if ($app.Mode -eq 'entry') {
                 if ($app.EntryPatterns) {
-                    $n += Clear-TransientEntries -Directory $expandedPath -Patterns @($app.EntryPatterns) `
-                        -EntryType $app.EntryType -MinAgeDays (Get-TransientAgeDays -Override $app.MinAgeDays) -Category $cat
+                    # Clear-DevCaches is called with the raw definition path (entries
+                    # resolve per directory); Clear-EntryDefinition is what expands it.
+                    if ($app.Path -match '[*?]' -or $app.KeepLatest -or $app.KeepTargetOf) {
+                        $n += Clear-EntryDefinition -App $app -Category $cat
+                    } else {
+                        $n += Clear-TransientEntries -Directory $expandedPath -Patterns @($app.EntryPatterns) `
+                            -EntryType $app.EntryType -MinAgeDays (Get-TransientAgeDays -Override $app.MinAgeDays) -Category $cat
+                    }
                 }
                 continue
             }
@@ -1454,6 +1668,25 @@ function Invoke-CleanupRun {
              'Event Logs + Font Cache' { 
                  $null = Clear-EventLogs
                  $null = Clear-FontCache
+             }
+             'Package Maintenance' {
+                 # Scoop cache cleanup cannot run during the planning pass (IsPreview is
+                 # always true there) and Preview must never delete, so it is queued
+                 # like DISM and runs only in the execution phase of a real run.
+                 if (-not (Get-Command scoop -ErrorAction SilentlyContinue)) {
+                     Register-SkippedItem -Reason 'Scoop not installed' -Target 'scoop'
+                 } else {
+                     # -a, not '*': a bare '*' is glob-expanded by PowerShell against the
+                     # current directory and reaches scoop as a filename, so only one
+                     # app (or none) would be cleaned. -a is scoop's own all-apps switch.
+                     if ($preview) { Write-CommandLog 'PREVIEW' 'scoop cleanup -a' }
+                     $script:PendingActions += [PSCustomObject]@{ Name = 'scoop cleanup'; Category = 'Package Maintenance'; Action = {
+                         Write-CommandLog 'RUN' 'scoop cleanup -a'
+                         & scoop cleanup -a | ForEach-Object { Write-CommandLog 'SCOOP' $_ }
+                         if ($LASTEXITCODE -ne 0) { throw "scoop cleanup exited with code $LASTEXITCODE" }
+                     } }
+                 }
+                 $null = Clear-DownloadsMaintenance
              }
              'Cloud Sync' {
                  # OneDrive, Google Drive, Dropbox temp files
@@ -1820,6 +2053,8 @@ Export-ModuleMember -Function @(
     'Expand-WildcardPath',
     'Get-TransientEntryMatches',
     'Clear-TransientEntries',
+    'Get-DownloadsMaintenanceMatches',
+    'Clear-DownloadsMaintenance',
     'Get-TransientAgeDays',
     'Clear-SystemCaches',
     'Clear-ChromiumCaches',

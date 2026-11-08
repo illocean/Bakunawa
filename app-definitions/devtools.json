@@ -128,14 +128,6 @@
     ]
   },
   {
-    "name": "codex-package-cache",
-    "process": ["opencode"],
-    "category": "Dev Caches",
-    "locations": [
-      { "env": "USERPROFILE", "path": ".codex/packages" }
-    ]
-  },
-  {
     "name": "NuGet-cache",
     "process": null,
     "category": "Dev Caches",
@@ -408,9 +400,17 @@
     "process": "omniroute",
     "category": "AI Agent Caches",
     "locations": [
-      { "env": "USERPROFILE", "path": ".omniroute/call_logs", "mode": "entry", "entryType": "directory", "entryPatterns": ["*"], "minAgeDays": 2 },
+      { "env": "USERPROFILE", "path": ".omniroute/call_logs", "mode": "entry", "entryType": "directory", "entryPatterns": ["*"], "minAgeDays": 1 },
       { "env": "USERPROFILE", "path": ".omniroute/logs" },
-      { "env": "USERPROFILE", "path": ".omniroute/db_backups" }
+      { "env": "USERPROFILE", "path": ".omniroute/db_backups", "mode": "entry", "entryType": "file", "entryPatterns": ["*.sqlite*"], "keepLatest": 1 }
+    ]
+  },
+  {
+    "name": "codex-sessions",
+    "process": ["codex"],
+    "category": "AI Agent Caches",
+    "locations": [
+      { "env": "USERPROFILE", "path": ".codex/sessions", "mode": "entry", "entryType": "directory", "entryPatterns": ["*"], "minAgeDays": 1 }
     ]
   },
   {

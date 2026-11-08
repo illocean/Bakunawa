@@ -606,11 +606,27 @@ function Get-LocationOptions {
         $null = [int]::TryParse([string]$Location.minAgeDays, [ref]$minAgeDays)
     }
 
+    # 0 means "no retention": every matching entry is age-gated only. A positive
+    # value keeps the newest N entries (by LastWriteTime) regardless of age, which
+    # is what release caches and rolling backups need (the live release and the
+    # newest backup must survive even when old).
+    $keepLatest = 0
+    if ($Location.PSObject.Properties['keepLatest'] -and $Location.keepLatest) {
+        $null = [int]::TryParse([string]$Location.keepLatest, [ref]$keepLatest)
+    }
+
+    # A sibling reparse point naming the live entry (Codex keeps 'current' one level
+    # up from releases). Whatever it resolves to is never a candidate.
+    $keepTargetOf = ''
+    if ($Location.PSObject.Properties['keepTargetOf']) { $keepTargetOf = [string]$Location.keepTargetOf }
+
     return [PSCustomObject]@{
         Mode          = $mode
         EntryPatterns = $patterns
         EntryType     = $entryType
         MinAgeDays    = $minAgeDays
+        KeepLatest    = $keepLatest
+        KeepTargetOf  = $keepTargetOf
     }
 }
 
@@ -625,7 +641,7 @@ function Get-AllAppDefinitions {
     from every JSON file is returned.
     .OUTPUTS
     Array of app definition objects with Name, Path, Env, Process, Category,
-    SourceFile, Mode, EntryPatterns, EntryType and MinAgeDays properties
+    SourceFile, Mode, EntryPatterns, EntryType, MinAgeDays and KeepLatest properties
     (flattened from locations).
     #>
     param([string]$Category)
@@ -699,6 +715,8 @@ function Get-AllAppDefinitions {
                             EntryPatterns = $options.EntryPatterns
                             EntryType     = $options.EntryType
                             MinAgeDays    = $options.MinAgeDays
+                            KeepLatest    = $options.KeepLatest
+                            KeepTargetOf  = $options.KeepTargetOf
                         })
                     }
                 }
@@ -769,6 +787,8 @@ function Get-AppDefinitions {
                     EntryPatterns = $options.EntryPatterns
                     EntryType     = $options.EntryType
                     MinAgeDays    = $options.MinAgeDays
+                    KeepLatest    = $options.KeepLatest
+                    KeepTargetOf  = $options.KeepTargetOf
                 })
             }
         }

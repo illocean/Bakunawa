@@ -151,6 +151,7 @@ function Get-DefaultConfig {
             "Prefetch" = @{ enabled = $true; riskTier = "Safe"; description = "Windows prefetch cache (Aggressive mode only)" }
             "DISM" = @{ enabled = $false; riskTier = "Moderate"; description = "Windows component store cleanup via DISM (Aggressive mode only; slow)" }
             "Event Logs + Font Cache" = @{ enabled = $true; riskTier = "Moderate"; description = "Clear font cache; Windows event logs are retained (Aggressive mode only)" }
+            "Package Maintenance" = @{ enabled = $false; riskTier = "Moderate"; description = "Scoop old-version cleanup (scoop cleanup) plus old Downloads installers and stale portable app updaters (Aggressive mode only)" }
             "GPU/Shell Caches" = @{ enabled = $true; riskTier = "Safe"; description = "GPU driver and shell extension caches" }
             "Recycle Bin" = @{ enabled = $false; riskTier = "Confirm"; description = "Empty recycle bin (requires confirmation)" }
             "Log Files" = @{ enabled = $false; riskTier = "Moderate"; description = "System and application log files" }

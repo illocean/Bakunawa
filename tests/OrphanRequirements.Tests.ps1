@@ -351,7 +351,7 @@ Describe 'Entry precedence and source encoding' {
         foreach ($name in $standard) {
             $aggressive | Should -Contain $name
         }
-        @($aggressive | Where-Object { $_ -notin $standard }) | Should -Be @('Prefetch', 'DISM', 'Event Logs + Font Cache')
+        @($aggressive | Where-Object { $_ -notin $standard }) | Should -Be @('Prefetch', 'DISM', 'Event Logs + Font Cache', 'Package Maintenance')
     }
     It 'runs ReportPath twice through the entry point and preserves the first report' {
         Mock Find-OrphanFolders { @() } -ModuleName Bakunawa.Bootstrap
