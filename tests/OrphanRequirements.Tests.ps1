@@ -196,7 +196,12 @@ Describe 'Orphan evidence, protected paths and common cleanup planning' {
         Mock -ModuleName Bakunawa.Cleanup Get-CleanupTasks { @('Game Caches','Browser Automation Caches' | ForEach-Object { [pscustomobject]@{Name = $_; Parallel = $false} }) }
         New-FixtureFile "$root/Roblox/Versions/v1/ClientCache/data.bin" 1024
         New-FixtureFile "$root/Roblox/Versions/v1/RobloxPlayerBeta.exe" 2048
-        New-FixtureFile "$root/ms-playwright/chromium-1228/browser.bin" 4096
+        # Get-AllAppDefinitions resolves a wildcard location to the installed build, so the
+        # fixture must use that resolved directory rather than a made-up revision, or no
+        # definition matches it and the candidate is silently dropped.
+        $playwright = @($definitions | Where-Object { $_.Name -eq 'Playwright' -and $_.Path -like '*ms-playwright*chromium-*' -and $_.Path -notlike '*headless_shell*' -and $_.Path -notmatch '[*?]' })[0]
+        $playwright | Should -Not -BeNullOrEmpty -Because 'a resolved Playwright build is required for this fixture'
+        New-FixtureFile "$($playwright.Path)/browser.bin" 4096
         $preview = Invoke-CleanupRun -Mode Preview -Config $cfg
         $preview.BytesFreed | Should -Be 5120
         $preview.Candidates.Count | Should -Be 2

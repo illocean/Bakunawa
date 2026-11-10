@@ -65,6 +65,19 @@ function Test-CleanupDirectory {
     catch { Register-CleanupError -Path $Path -Message $_.Exception.Message; return $false }
 }
 
+# Decides whether a planned target drifted between the planning and execution phases.
+function Test-CandidateChanged {
+    [CmdletBinding()]
+    param([Parameter(Mandatory)]$Before, [Parameter(Mandatory)]$After)
+    # A target that grew, or gained files, since the plan was approved may hold data
+    # the plan never measured, so it must be abandoned. A newer write timestamp alone
+    # is not a change: services rewrite live caches (Prefetch, Downloader, browser
+    # caches) between the planning and execution phases, and treating that as drift
+    # silently skipped most of a real run. Same-or-smaller size and file count still
+    # covers everything the plan accounted for.
+    return ($After.Bytes -gt $Before.Bytes -or $After.Files -gt $Before.Files)
+}
+
 # Private helper: the single deletion choke point. Re-validates immediately before every
 # mutation so nothing is deleted on a stale measurement, and honours preview mode.
 # Returns validated bytes for preview or successful processing; failures throw.
@@ -75,8 +88,12 @@ function Remove-ItemSafely {
         [string]$Reason = 'Cleanup',
         [ValidateSet('Tier1','Tier2','Tier3')][string]$Tier = 'Tier1',
         [string]$DetectorName = 'Cleanup',
+        # Defaults to every core exclusion. Only a caller that owns a narrower scope
+        # (Downloads maintenance) may pass a set derived from it, never an empty one.
+        [string[]]$Exclusions = $null,
         [switch]$Preview
     )
+    if ($null -eq $Exclusions -or $Exclusions.Count -eq 0) { $Exclusions = [string[]]@(Get-CoreExcludedPaths) }
     $script:PartialActedBytes = 0L
     $script:PartialOutcomeKnown = $true
     $resolved = [IO.Path]::GetFullPath($Path).TrimEnd('\')
@@ -84,7 +101,7 @@ function Remove-ItemSafely {
         $resolved -in @((Get-EnvPath 'USERPROFILE'),(Get-EnvPath 'LOCALAPPDATA'),(Get-EnvPath 'APPDATA'),(Get-EnvPath 'SystemRoot'),(Get-EnvPath 'ProgramData'),(Get-EnvPath 'ProgramFiles'),(Get-EnvPath 'ProgramFiles(x86)'))) {
         throw "Refusing to remove a drive or system/profile root: $resolved"
     }
-    $measurement = [Bakunawa.Scanner]::Inspect($resolved, [string[]]@(Get-CoreExcludedPaths))
+    $measurement = [Bakunawa.Scanner]::Inspect($resolved, $Exclusions)
     if ($script:Planning) {
         Add-CleanupRecord -Path $resolved -Category $Reason -Bytes $measurement.Bytes -Measurement $measurement -Detector $DetectorName -Tier $Tier -Finding $script:CurrentOrphan
         return [long]$measurement.Bytes
@@ -93,12 +110,12 @@ function Remove-ItemSafely {
     if ($Tier -eq 'Tier3') { throw "Report-only candidate: $resolved" }
     # Quarantine was removed: every delete is final, which is what actually frees the space.
     # Re-inspect immediately before the mutation so nothing is deleted on a stale measurement.
-    $null = [Bakunawa.Scanner]::Inspect($resolved, [string[]]@(Get-CoreExcludedPaths))
+    $null = [Bakunawa.Scanner]::Inspect($resolved, $Exclusions)
     try { Remove-Item -LiteralPath $resolved -Recurse -Force -ErrorAction Stop }
     catch {
         $failure = $_
         try {
-            $remaining = [Bakunawa.Scanner]::Inspect($resolved, [string[]]@(Get-CoreExcludedPaths))
+            $remaining = [Bakunawa.Scanner]::Inspect($resolved, $Exclusions)
             $script:PartialActedBytes = [math]::Max(0, $measurement.Bytes - $remaining.Bytes)
         } catch { $script:PartialOutcomeKnown = $false }
         throw $failure
@@ -347,6 +364,33 @@ function Get-TransientEntryMatches {
 # junction never is. Everything else under Downloads is conservatively kept,
 # including portable apps that normally reinstall by dropping a new exe beside
 # themselves. Returns matches with Bytes so clear and measure agree.
+# The Downloads scope is a hard-excluded known folder, so Scanner.Inspect with the
+# default exclusion list always rejects product files there ("Protected cleanup target").
+# These two fixed trees are the requested Downloads scope; size and delete them with
+# that scope minus the Downloads exclusion itself, while keeping every other protection
+# (C:-only, reparse-point, protected-extension, age checks). Measurement and deletion
+# must use the same list, so both call this helper.
+function Get-DownloadsScopeExclusions {
+    [CmdletBinding()]
+    param()
+    $downloads = Join-EnvPath 'USERPROFILE' 'Downloads'
+    $core = @(Get-CoreExcludedPaths)
+    $scoped = [string[]]@(
+        foreach ($excluded in $core) {
+            if (-not ([Bakunawa.Scanner]::Within($excluded, $downloads) -or [Bakunawa.Scanner]::Within($downloads, $excluded))) {
+                $excluded
+            }
+        }
+    )
+    if ($scoped.Count -eq 0 -and $core.Count -gt 0) {
+        # Only reachable when the user's Downloads exclusion is the entire list:
+        # an empty exclusion list would also admit unintended paths, so keep one
+        # non-Downloads exclusion as a fail-closed guard.
+        $scoped = [string[]]@('C:\Windows')
+    }
+    return $scoped
+}
+
 function Get-DownloadsMaintenanceMatches {
     [CmdletBinding()]
     param([string]$Category = 'Package Maintenance')
@@ -359,8 +403,12 @@ function Get-DownloadsMaintenanceMatches {
         Register-SkippedItem -Reason ([Bakunawa.Scanner]::PathIssue($downloads)) -Target $downloads
         return @()
     }
-    # Installers in the Downloads root only (never into subfolders): the age gate
-    # keeps anything recently downloaded, so a file mid-use can never be a match.
+    # Downloads is a hard-excluded known folder (Get-ExcludedPaths), so Scanner.Inspect
+    # with the default exclusion list always rejects product files here ("Protected
+    # cleanup target"). These two fixed trees are the requested Downloads scope; size
+    # them with that scope minus the Downloads exclusion itself, while keeping every
+    # other protection (C:-only, reparse-point, protected-extension, age checks).
+    $scopeExclusions = @(Get-DownloadsScopeExclusions)
     $installerPatterns = @('*.Installer.exe', '*Setup*.exe', '*Install*.exe', '*Telegram*.exe', '*-setup.exe', '*.msi')
     $installerCutoff = (Get-Date).AddDays(-30)
     try { $files = @(Get-ChildItem -LiteralPath $downloads -File -Force -ErrorAction Stop) }
@@ -373,7 +421,7 @@ function Get-DownloadsMaintenanceMatches {
         if (Test-ProtectedFileExtension $file.Name) { $reason = 'protected' }
         elseif ($file.LastWriteTime -ge $installerCutoff) { $reason = 'not stale' }
         $bytes = $null
-        try { $bytes = [long]([Bakunawa.Scanner]::Inspect($file.FullName, [string[]]@(Get-CoreExcludedPaths))).Bytes } catch { }
+        try { $bytes = [long]([Bakunawa.Scanner]::Inspect($file.FullName, $scopeExclusions)).Bytes } catch { }
         $matches.Add([PSCustomObject]@{ FullName = $file.FullName; Name = $file.Name; Bytes = $bytes; IsContainer = $false; Reason = $reason })
     }
     # The portable app keeps its session in tdata beside the executable, so deleting
@@ -394,7 +442,7 @@ function Get-DownloadsMaintenanceMatches {
             if (Test-ProtectedFileExtension $file.Name) { $reason = 'protected' }
             elseif ($file.LastWriteTime -ge $installerCutoff) { $reason = 'not stale' }
             $bytes = $null
-            try { $bytes = [long]([Bakunawa.Scanner]::Inspect($file.FullName, [string[]]@(Get-CoreExcludedPaths))).Bytes } catch { }
+            try { $bytes = [long]([Bakunawa.Scanner]::Inspect($file.FullName, $scopeExclusions)).Bytes } catch { }
             $matches.Add([PSCustomObject]@{ FullName = $file.FullName; Name = $file.Name; Bytes = $bytes; IsContainer = $false; Reason = $reason })
         }
         }
@@ -407,6 +455,7 @@ function Clear-DownloadsMaintenance {
     param()
     $cat = 'Package Maintenance'
     $n = 0
+    $scopeExclusions = Get-DownloadsScopeExclusions
     foreach ($match in @(Get-DownloadsMaintenanceMatches -Category $cat)) {
         if ($match.Reason) {
             $detail = Get-TransientSkipDetail -Reason $match.Reason -MinAgeDays 30
@@ -415,7 +464,7 @@ function Clear-DownloadsMaintenance {
             continue
         }
         try {
-            $size = Remove-ItemSafely -Path $match.FullName -Reason $cat -Preview:$script:IsPreview
+            $size = Remove-ItemSafely -Path $match.FullName -Reason $cat -Exclusions $scopeExclusions -Preview:$script:IsPreview
             $script:BytesFreed += $size
             $script:TaskBytes += $size
             $script:TaskCleared++
@@ -1467,7 +1516,8 @@ function Clear-CachedOrphans {
             $app = $script:OrphanRulePaths[$orphan.Path]
             if (-not $app -or -not (Test-OrphanEvidence -App $app).Eligible) { throw 'Orphan evidence no longer passes.' }
             $current = [Bakunawa.Scanner]::Inspect($orphan.Path, [string[]]@(Get-ScanExclusions))
-            if ($current.Bytes -ne $orphan.Size -or $current.LatestWriteUtc -ne $orphan.LatestWriteUtc -or $current.Files -ne $orphan.FileCount) {
+            $before = [pscustomobject]@{ Bytes = [long]$orphan.Size; Files = [int]$orphan.FileCount }
+            if (Test-CandidateChanged -Before $before -After $current) {
                 throw 'Target changed since scan; rescan required.'
             }
             $script:CurrentOrphan = $orphan
@@ -1868,7 +1918,7 @@ function Invoke-CleanupRun {
                     if (-not $row.Finding.EvidenceRule -or -not $app -or -not (Test-OrphanEvidence -App $app).Eligible) { throw 'No evidence: orphan rule no longer passes.' }
                 }
                 $current = [Bakunawa.Scanner]::Inspect($row.Path, [string[]]@(Get-CoreExcludedPaths))
-                if ($current.Bytes -ne $row.Measurement.Bytes -or $current.Files -ne $row.Measurement.Files -or $current.LatestWriteUtc -ne $row.Measurement.LatestWriteUtc) { throw 'Changed since scan; rescan required.' }
+                if (Test-CandidateChanged -Before $row.Measurement -After $current) { throw 'Changed since scan; rescan required.' }
                 foreach ($app in $script:DefinitionPaths) {
                     if (-not $app.Process -or -not (Test-AnyProcessRunning -RunningProcesses $runningNow -Names @($app.Process))) { continue }
                     if ([Bakunawa.Scanner]::Within($row.Path, $app.Path) -or [Bakunawa.Scanner]::Within($app.Path, $row.Path)) { throw "In use: $($app.Name)" }
@@ -2054,7 +2104,9 @@ Export-ModuleMember -Function @(
     'Get-TransientEntryMatches',
     'Clear-TransientEntries',
     'Get-DownloadsMaintenanceMatches',
+    'Get-DownloadsScopeExclusions',
     'Clear-DownloadsMaintenance',
+    'Test-CandidateChanged',
     'Get-TransientAgeDays',
     'Clear-SystemCaches',
     'Clear-ChromiumCaches',

@@ -402,7 +402,7 @@
     "locations": [
       { "env": "USERPROFILE", "path": ".omniroute/call_logs", "mode": "entry", "entryType": "directory", "entryPatterns": ["*"], "minAgeDays": 1 },
       { "env": "USERPROFILE", "path": ".omniroute/logs" },
-      { "env": "USERPROFILE", "path": ".omniroute/db_backups", "mode": "entry", "entryType": "file", "entryPatterns": ["*.sqlite*"], "keepLatest": 1 }
+      { "env": "USERPROFILE", "path": ".omniroute/db_backups", "mode": "entry", "entryType": "file", "entryPatterns": ["*.sqlite*"], "keepLatest": 1, "minAgeDays": 1 }
     ]
   },
   {

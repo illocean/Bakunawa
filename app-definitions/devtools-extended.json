@@ -81,7 +81,7 @@
     "process": ["opencode"],
     "category": "Dev Caches",
     "locations": [
-      { "env": "USERPROFILE", "path": ".codex/packages/app-server-daemon/releases", "mode": "entry", "entryType": "directory", "entryPatterns": ["*"], "keepLatest": 1, "keepTargetOf": "..\\current" }
+      { "env": "USERPROFILE", "path": ".codex/packages/app-server-daemon/releases", "mode": "entry", "entryType": "directory", "entryPatterns": ["*"], "keepLatest": 1, "keepTargetOf": "..\\current", "minAgeDays": 1 }
     ]
   }
 ]

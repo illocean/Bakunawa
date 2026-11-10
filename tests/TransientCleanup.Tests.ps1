@@ -108,7 +108,10 @@ Describe 'App definitions: entry-mode fields' {
 
     It 'leaves the age gate to the configured scan age unless a definition overrides it' {
         $defs = @(Get-AllAppDefinitions -Category 'Dev Caches' | Where-Object { $_.Mode -eq 'entry' })
-        foreach ($entry in $defs) { $entry.MinAgeDays | Should -Be 0 -Because '0 means: use the configured scan age' }
+        $overrides = @($defs | Where-Object { $_.Name -eq 'codex-release-cache' -and $_.MinAgeDays -gt 0 })
+        $overrides.Count | Should -Be 1 -Because 'codex-release-cache pins minAgeDays so stale releases clear without waiting 30 days'
+        $others = @($defs | Where-Object { $_.Name -ne 'codex-release-cache' })
+        foreach ($entry in $others) { $entry.MinAgeDays | Should -Be 0 -Because '0 means: use the configured scan age' }
         Get-TransientAgeDays | Should -BeGreaterThan 0
     }
 }
